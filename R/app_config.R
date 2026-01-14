@@ -42,3 +42,29 @@ get_golem_config <- function(
     use_parent = use_parent
   )
 }
+
+
+# 为一些字符串规定好特定的对应颜色
+color_vec <- c(
+  "男" = "#92C5DE",
+  "女" = "#E78AC3",
+  "+" = "#FF7F00",
+  "结果无效" = "#B3B3B3",
+  "-" = "#B2DF8A",
+  "±" = "#CAB2D6",
+  "阴性" = "#B3B3B3",
+  "正常" = "#B2DF8A",
+  "偏高" = "#FF7F00",
+  "偏低" = "#92C5DE"
+)
+
+
+color_default <- c(
+  "#66C2A5", "#FC8D62", "#8DA0CB", "#E78AC3",
+  "#A6D854", "#FFD92F", "#E5C494", "#B3B3B3",
+  "pink",    "#1F78B4", "#33A02C", "#FB9A99",
+  "#CAB2D6", "#FDBF6F", "#B15928", "#A6CEE3",
+  "#B2DF8A", "#6A3D9A", "#FF7F00", "#FFFF99",
+  "#E31A1C", "#F4A582", "#92C5DE", "#D1E5F0",
+  "#4575B4", "#66A61E", "#A6761D", "#E6AB02"
+)

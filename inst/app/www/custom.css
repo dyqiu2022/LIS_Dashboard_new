@@ -1,0 +1,31 @@
+/* 1. 初始状态：警告橘 */
+.stat-warning {
+  color: #e67e22 !important;
+  font-weight: bold;
+}
+
+/* 2. 读取中状态：蓝色 + 呼吸灯动画 */
+.stat-loading {
+  color: #3498db !important;
+  font-weight: 500;
+  display: inline-block;
+  animation: breathe 1.5s infinite ease-in-out; /* 增加呼吸灯动画 */
+}
+
+/* 3. 成功状态：舒服的深绿 */
+.stat-success {
+  color: #28a745 !important;
+  font-weight: 500;
+  background-color: #e8f5e9;
+  padding: 5px 12px;
+  border-radius: 4px;
+  display: inline-block;
+  border: 1px solid #c8e6c9;
+}
+
+/* 呼吸灯动画定义 */
+@keyframes breathe {
+  0% { opacity: 0.5; transform: scale(0.98); }
+  50% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0.5; transform: scale(0.98); }
+}
