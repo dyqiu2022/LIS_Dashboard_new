@@ -47,22 +47,8 @@ mod_qualitative_analysis_ui <- function(id) {
       # 2/1 表示 宽度2 : 高度1 (即高度是宽度的0.5倍)
       mod_qualitative_analysis_pie_chart_ui(ns("pie_chart")),
 
-      layout_sidebar(
-        fillable = TRUE,
-        padding = 0,
-        gap = "20px",
-        class = "h-100",
-        sidebar = sidebar(
-          title = "分析参数配置2",
-          bg = "#f8f9fa",
-          open = "desktop",
-          "这里放置输入控件..."
-        ),
-        card(
-          full_screen = TRUE,
-          "内容区域 2"
-        )
-      )
+      # 右侧第一个连续变量堆叠图（上图）
+      mod_qualitative_analysis_consecutive_hist_ui(ns("consecutive_hist_top"))
     ),
 
 
@@ -73,30 +59,8 @@ mod_qualitative_analysis_ui <- function(id) {
       gap = "20px",       # 卡片之间的间距
       mod_qualitative_analysis_discrete_hist_ui(ns("discrete_hist")),
 
-      layout_sidebar(
-        fillable = TRUE,
-        padding = 0,
-        gap = "20px",
-        class = "h-100",
-        sidebar = sidebar(
-          bg = "#f8f9fa",
-          open = "desktop",
-          div(
-            selectInput(ns("age_grain"), "年龄颗粒度",
-                        choices = c("1", "2", "3", "4", "5", "10", "12", "15", "20"),
-                        selected = "3", width = "100%"),
-
-            selectInput(ns("time_grain"), "时间颗粒度",
-                        choices = c("month", "week", "day"),
-                        selected = "month", width = "100%")
-          )
-        ),
-      card(
-        style = "aspect-ratio: 3/ 2; overflow: auto;",
-        full_screen = TRUE,
-        card_header("图表 4"),
-        "内容区域 4"
-      ))
+      # 右侧第二个连续变量堆叠图（下图）
+      mod_qualitative_analysis_consecutive_hist_ui(ns("consecutive_hist_bottom"))
     )
   )
 }
@@ -128,6 +92,21 @@ mod_qualitative_analysis_server <- function(id, global_store){
 
     mod_qualitative_analysis_pie_chart_server("pie_chart", global_store, reactive(input$header_for_stack), reactive(input$hash_color))
     mod_qualitative_analysis_discrete_hist_server("discrete_hist", global_store, reactive(input$header_for_stack), reactive(input$hash_color))
+    
+    # 右侧两个连续变量堆叠图模块（一上一下）
+    mod_qualitative_analysis_consecutive_hist_server(
+      "consecutive_hist_top",
+      global_store,
+      reactive(input$header_for_stack),
+      reactive(input$hash_color)
+    )
+    
+    mod_qualitative_analysis_consecutive_hist_server(
+      "consecutive_hist_bottom",
+      global_store,
+      reactive(input$header_for_stack),
+      reactive(input$hash_color)
+    )
   })
 }
 

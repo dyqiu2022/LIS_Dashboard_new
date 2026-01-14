@@ -1,0 +1,5894 @@
+---
+title: "LIS数据动态看板"
+output:
+  flexdashboard::flex_dashboard:
+    theme:
+      version: 4
+      bootswatch: minty
+    orientation: columns
+    vertical_layout: scroll
+runtime: shiny
+---
+```{r, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(tidyverse)
+library(lubridate)
+library(plotly)
+library(wordcloud2)
+library(DT)
+library(readxl)
+library(shinyWidgets)
+library(jiebaR)
+library(colorspace)
+library(digest)
+library(openxlsx)
+library(quantreg)
+library(reshape2)
+library(gridExtra)
+library(emmeans)
+library(cobs)
+library(PlackettLuce)
+library(refineR)
+library(kableExtra)
+library(lubridate)
+
+# options(shiny.error = browser)
+options(shiny.reactlog=TRUE) 
+options(shiny.maxRequestSize = 1000*1024^2)
+```
+
+
+```{r}
+# 根据字符串生成颜色
+color_vec <- c(
+  "男" = "#92C5DE",
+  "女" = "#E78AC3",
+  "+" = "#FF7F00",
+  "结果无效" = "#B3B3B3",
+  "-" = "#B2DF8A",
+  "±" = "#CAB2D6",
+  "阴性" = "#B3B3B3",
+  "正常" = "#B2DF8A",
+  "偏高" = "#FF7F00",
+  "偏低" = "#92C5DE"
+)
+
+log_trans <- function(input, base){
+  log(input+1, base = base)
+}
+
+# 最简实现：计算一个值在数据集中的分位数位置
+get_quantile_position <- function(data, value) {
+  # 计算小于等于给定值的样本数
+  le_count <- sum(data <= value)
+  # 计算小于给定值的样本数
+  lt_count <- sum(data < value)
+  # 总样本数
+  n <- length(data)
+  
+  # 使用标准分位数定义 (Type 7，R默认)
+  position <- (le_count + lt_count) / (2 * n)
+  
+  return(position)
+}
+
+get_baseline_level <- function(formula_str, data) {
+  # 解析公式获取所有变量
+  formula_obj <- as.formula(formula_str)
+  all_terms <- attr(terms(formula_obj), "term.labels")
+  
+  # 提取原始变量（去除转换和交互）
+  raw_vars <- unique(unlist(lapply(all_terms, function(term) {
+    # 分离交互项
+    if (grepl(":", term)) {
+      return(unlist(strsplit(term, ":")))
+    }
+    # 提取转换项中的原始变量
+    if (grepl("^I\\(", term)) {
+      return(gsub("^I\\(([^)]+)\\)$", "\\1", term))
+    }
+    # 其他函数中的变量
+    if (grepl("\\(", term)) {
+      return(gsub(".*\\(([^)]+)\\).*", "\\1", term))
+    }
+    return(term)
+  })))
+  
+  # 去除重复和操作符
+  raw_vars <- unique(gsub("\\^.*", "", raw_vars))
+  raw_vars <- raw_vars[!raw_vars %in% c("+", "-", "*", "/")]
+  
+  # 初始化结果数据框
+  baseline_df <- data.frame(matrix(ncol = length(raw_vars), nrow = 1))
+  colnames(baseline_df) <- raw_vars
+  
+  # 处理每个原始变量
+  for (var in raw_vars) {
+    if (var %in% names(data)) {
+      # 数值变量处理
+      if (is.numeric(data[[var]]) || is.integer(data[[var]])) {
+        baseline_df[[var]] <- median(data[[var]], na.rm = TRUE)
+      } 
+      # 离散变量处理
+      else if (is.factor(data[[var]]) || is.character(data[[var]]) || is.logical(data[[var]])) {
+        # 计算频率表并取最高频率的类别
+        freq_table <- table(data[[var]], useNA = "no")
+        baseline_df[[var]] <- names(freq_table)[which.max(freq_table)]
+      } 
+      # 其他类型变量处理
+      else {
+        warning(paste("变量", var, "类型不支持，使用第一个值"))
+        baseline_df[[var]] <- data[[var]][1]
+      }
+    } else {
+      warning(paste("变量", var, "在数据中不存在，设为NA"))
+      baseline_df[[var]] <- NA
+    }
+  }
+  
+  return(baseline_df)
+}
+
+# HSL转RGB辅助函数
+hsl_to_rgb <- function(h, s, l) {
+  h <- h %% 1
+  if (s == 0) {
+    r <- g <- b <- l * 255
+  } else {
+    hue_to_rgb <- function(p, q, t) {
+      t <- ifelse(t < 0, t + 1, ifelse(t > 1, t - 1, t))
+      case_when(
+        t < 1/6 ~ p + (q - p) * 6 * t,
+        t < 1/2 ~ q,
+        t < 2/3 ~ p + (q - p) * (2/3 - t) * 6,
+        TRUE ~ p
+      )
+    }
+    q <- ifelse(l < 0.5, l * (1 + s), l + s - l * s)
+    p <- 2 * l - q
+    r <- hue_to_rgb(p, q, h + 1/3)
+    g <- hue_to_rgb(p, q, h)
+    b <- hue_to_rgb(p, q, h - 1/3)
+  }
+  rgb <- pmax(pmin(c(r, g, b), 1), 0) * 255
+  round(rgb)
+}
+
+# 主颜色生成函数
+string_to_color <- function(text, 
+                           predefined = NULL, 
+                           saturation = 0.6, 
+                           lightness = 0.6) {
+  
+  if (text %in% names(color_vec)){
+    return(color_vec[[text]])
+  }
+  
+  # 检查预定义颜色
+  if (!is.null(predefined) && text %in% names(predefined)) {
+    return(predefined[[text]])
+  }
+  
+  # 生成MD5哈希
+  hash_hex <- digest(text, algo = "md5", serialize = FALSE)
+  
+  # 取哈希前6字符转色相 (0-360°)
+  hue_hex <- substr(hash_hex, 1, 6)
+  hue <- (strtoi(hue_hex, 16L) %% 360) / 360
+  
+  # 转换HSL到RGB
+  rgb <- hsl_to_rgb(hue, saturation, lightness)
+  
+  # 转为16进制颜色码
+  sprintf("#%02X%02X%02X", rgb[1], rgb[2], rgb[3])
+}
+
+# 改进的Tukey方法计算参考区间函数
+calculate_tukey_ri <- function(data_vector, RIperc) {
+  # 移除NA值并转换为数值
+  data <- as.numeric(na.omit(data_vector))
+  
+  # 确保有足够的数据
+  if (length(data) < 2) {
+    n_perc <- length(RIperc)
+    RI_matrix <- matrix(nrow = n_perc, ncol = 4)
+    colnames(RI_matrix) <- c("RIperc", "pointEst", "lower", "upper")
+    for (i in 1:n_perc) {
+      RI_matrix[i, "RIperc"] <- RIperc[i]
+      RI_matrix[i, "pointEst"] <- NA
+      RI_matrix[i, "lower"] <- NA
+      RI_matrix[i, "upper"] <- NA
+    }
+    return(RI_matrix)
+  }
+  
+  # 计算四分位数
+  q1 <- quantile(data, 0.25, na.rm = TRUE)
+  q3 <- quantile(data, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  
+  # 计算Tukey fences，但确保不会产生无意义的负值
+  # 对于生物医学指标，通常不会为负，因此将下限限制在0或数据最小值
+  data_min <- min(data)
+  data_max <- max(data)
+  
+  # 计算理论上的Tukey fences
+  theoretical_lower <- q1 - 1.5 * iqr
+  theoretical_upper <- q3 + 1.5 * iqr
+  
+  # 使用更合理的下限：取理论下限和数据最小值的较大值，但不低于0
+  lower_fence <- max(theoretical_lower, data_min, 0)
+  upper_fence <- min(theoretical_upper, data_max)
+  
+  # 如果理论范围明显不合理，使用实际数据范围
+  if (theoretical_lower < data_min * 0.5) {
+    warning("Tukey下限明显低于数据实际范围，使用数据最小值")
+    lower_fence <- data_min
+  }
+  
+  # 创建结果矩阵
+  n_perc <- length(RIperc)
+  RI_matrix <- matrix(nrow = n_perc, ncol = 4)
+  colnames(RI_matrix) <- c("RIperc", "pointEst", "lower", "upper")
+  
+  for (i in 1:n_perc) {
+    perc <- RIperc[i]
+    RI_matrix[i, "RIperc"] <- perc
+    
+    # 对于不同的分位数，使用Tukey fences或实际分位数
+    if (perc <= 0.25) {
+      RI_matrix[i, "pointEst"] <- lower_fence
+      RI_matrix[i, "lower"] <- lower_fence
+      RI_matrix[i, "upper"] <- lower_fence
+    } else if (perc >= 0.75) {
+      RI_matrix[i, "pointEst"] <- upper_fence
+      RI_matrix[i, "lower"] <- upper_fence
+      RI_matrix[i, "upper"] <- upper_fence
+    } else {
+      actual_perc <- quantile(data, perc, na.rm = TRUE)
+      RI_matrix[i, "pointEst"] <- actual_perc
+      RI_matrix[i, "lower"] <- actual_perc
+      RI_matrix[i, "upper"] <- actual_perc
+    }
+  }
+  
+  return(RI_matrix)
+}
+```
+
+```{r}
+discretize_age <- function(age_vector, grain = 3) {
+  # 参数检查
+  if(!is.numeric(age_vector)) stop("输入必须是数值向量")
+  if(any(age_vector < 0)) stop("年龄不能为负数")
+  if(grain <= 0 || !is.numeric(grain)) stop("颗粒度必须为正整数")
+  
+  # 计算分箱断点
+  max_age <- max(age_vector)
+  min_age <- min(age_vector)
+  breaks <- seq(min_age, max_age + grain, by = grain)
+  
+  # 生成区间标签
+  labels <- sapply(1:(length(breaks)-1), function(i) {
+    paste0(breaks[i], "-", breaks[i+1]-1)
+  })
+  
+  # 分箱并转化为有序因子
+  cut(
+    age_vector,
+    breaks = breaks,
+    right = FALSE,        # 左闭右开区间
+    labels = labels,
+    ordered_result = TRUE # 生成有序因子
+  )
+}
+
+# 聚类函数
+grouping_muti_groups <- function(info_combined,list_condition,not,not_restric){
+  info_split <- unlist(strsplit(as.character(info_combined),split = "[；，,;|()（）]"))
+  status_for_all_segments <- FALSE
+  for (i in info_split){ # i 循环是临床诊断片段的循环
+    for (j in list_condition){ # j循环是3个且条件的循环
+      status_for_and_condition <- FALSE
+      for (g in j){ # g循环是且条件内部的或条件的循环
+        if(grepl(i,pattern=g,fixed=TRUE)|g=="ALL"){ # “或”条件判断
+          status_for_and_condition <- TRUE
+        }
+        if(status_for_and_condition==TRUE){# 只要有一个“或”condition是TURE，则当前“且”condition通过，进入下一个“且”condition判断
+          break
+        }
+      }
+      if (status_for_and_condition==FALSE){ # 如果有的且逻辑不满足，则打破循环，进入下一个诊断关键词的判断（打破循环，下面还要打破一次）
+        break
+      }
+    }
+    if (status_for_and_condition==FALSE){ # 如果有的且逻辑不满足，则打破循环，进入下一个诊断关键词的判断（下一个诊断关键词）
+      next
+    }    
+    
+    # 用“非”条件的限制条件判断是否要进行非条件的判定
+    restricted <- FALSE
+    for (l in not_restric){
+      if (grepl(i,pattern=l,fixed=TRUE)){ # 判断诊断中是否出现限制条件
+        restricted <- TRUE
+      }
+    }
+    
+    if(restricted==FALSE){ # 如果诊断中出现了限制条件，则对“非”条件的筛选进行限制，不进行“非”条件的筛选
+      
+      not_ <- FALSE
+      for (h in not) {
+        if (grepl(i,pattern=h,fixed=TRUE)) { # “非”条件筛选
+          not_ <- TRUE
+          break # 如果满足了任何的非条件，则打破循环，进入下一个诊断关键词的判断
+        }
+      }
+      
+      if (not_==TRUE) {
+        next # 如果满足了任何的非条件，则打破循环，进入下一个诊断关键词的判断
+      }
+      
+    }
+    status_for_all_segments <- TRUE #如果程序能够执行到这里不被break，则说明当前关键词合格了，只要有一个关键词合格，整个临床诊断就合格
+  }
+  return(status_for_all_segments)
+}
+
+
+discretize_time <- function(datetime, grain = c("month", "week", "day")) {
+  # 参数验证
+  if (!inherits(datetime, "POSIXct")) {
+    stop("输入必须是POSIXct格式的日期时间向量")
+  }
+  grain <- tolower(grain[1])
+  
+  # 核心离散化逻辑
+  switch(grain,
+    "month" = {
+      month_str <- format(datetime, "%Y-%m")
+      factor(month_str, 
+             levels = unique(month_str[order(datetime)]),
+             ordered = TRUE)
+    },
+    "week" = {
+      year <- format(datetime, "%Y")
+      week_num <- strftime(datetime, format = "%V")  # ISO周数（01-53）
+      week_label <- paste0(year, "-W", week_num)
+      factor(week_label, 
+             levels = unique(week_label[order(datetime)]),
+             ordered = TRUE)
+    },
+    "day" = {
+      day_str <- format(datetime, "%Y-%m-%d")
+      factor(day_str, 
+             levels = unique(day_str[order(datetime)]),
+             ordered = TRUE)
+    },
+    stop("不支持的颗粒度类型，请选择'month', 'week'或'day'")
+  )
+}
+
+colors4 <- c(
+  "#66C2A5", "#FC8D62", "#8DA0CB", "#E78AC3", 
+  "#A6D854", "#FFD92F", "#E5C494", "#B3B3B3", 
+  "pink",    "#1F78B4", "#33A02C", "#FB9A99",
+  "#CAB2D6", "#FDBF6F", "#B15928", "#A6CEE3", 
+  "#B2DF8A", "#6A3D9A", "#FF7F00", "#FFFF99", 
+  "#E31A1C", "#F4A582", "#92C5DE", "#D1E5F0",  
+  "#4575B4", "#66A61E", "#A6761D", "#E6AB02"
+)
+
+patient_colors <- qualitative_hcl(
+  n = 7,
+  l = 70,                # 亮度（0-100，值越大越柔和）
+  c = 50,                # 色度（0-100，控制饱和度）
+  alpha = 0.8            # 透明度（可选）
+)
+
+patient_colors <- rep(patient_colors, 50) %>% unlist
+
+# 公式转换函数
+safe_formula <- function(formula_str, response_var) {
+  tryCatch({
+    # 基本输入验证
+    if (!is.character(formula_str) || length(formula_str) != 1) {
+      return(NULL)
+    }
+    
+    # 构建完整公式字符串
+    full_formula_str <- paste(response_var, "~", formula_str)
+    
+    # 尝试转换为公式
+    formula_obj <- as.formula(full_formula_str)
+    
+    # 验证结果确实是公式
+    if (!inherits(formula_obj, "formula")) {
+      return(NULL)
+    }
+    
+    # 返回成功的公式对象
+    return(formula_obj)
+    
+  }, error = function(e) {
+    # 记录错误信息（可选）
+    message("公式转换失败: ", e$message)
+    return(NULL)
+  })
+}
+
+smooth_derivative <- function(fit, x_points, h_factor = 0.001, shrink_factor = 0.1) {
+  # 使用四分位距(IQR)标准化步长
+  x_iqr <- IQR(x_points, na.rm = TRUE)
+  h_base <- h_factor * x_iqr
+  
+  # 确定前0.2%区域的边界
+  x_sorted <- sort(x_points)
+  threshold <- x_sorted[ceiling(0.002 * length(x_sorted))]
+  
+  # 计算自适应步长向量
+  h_values <- ifelse(x_points < threshold, shrink_factor * h_base, h_base)
+  
+  # 初始化导数向量
+  dy_dx <- numeric(length(x_points))
+  
+  # 计算中心差分
+  for (i in seq_along(x_points)) {
+    x <- x_points[i]
+    h <- h_values[i]
+    
+    # 边界保护
+    x_left <- max(x - h, min(x_points))
+    x_right <- min(x + h, max(x_points))
+    
+    # 使用平滑预测
+    y_left <- predict(fit, x_left)[, 2]
+    y_right <- predict(fit, x_right)[, 2]
+    
+    dy_dx[i] <- abs((y_right - y_left) / (x_right - x_left))
+  }
+  
+  return(dy_dx)
+}
+
+```
+
+```{r}
+# 分词与词向量函数
+get_vec_ <- function(word, embedding_matrix) {
+  if (word %in% rownames(embedding_matrix)) {
+    embedding_matrix[word, , drop = FALSE]
+  } else {
+    matrix(NA)
+  }
+}
+
+# 函数，用于将分词结果与词性相连接
+named_lst_paste <- function(named_lst){
+  paste0(named_lst, "(", named_lst %>% names, ")")
+}
+
+
+
+# 自定义可追踪进度的kmeans
+kmeans_with_progress <- function(x, centers, iter.max = 10L, nstart = 1L) {
+  # 初始化进度条
+  withProgress(message = 'Running k-means', value = 0, {
+    best <- Inf
+    for (i in seq_len(nstart)) {
+      incProgress(1/nstart, detail = paste("Initialization", i, "of", nstart))
+      
+      # 调用原始kmeans（单次nstart）
+      Z <- stats::kmeans(x, centers, iter.max = iter.max, nstart = 1)
+      
+      # 保留最佳结果
+      if (sum(Z$withinss) < best) {
+        best_result <- Z
+        best <- sum(Z$withinss)
+      }
+    }
+  })
+  best_result
+}
+```
+
+```{r}
+# 定义变换函数
+boxcox_transform <- function(x, lambda) {
+  if (lambda == 0) log(x) else (x^lambda - 1)/lambda
+}
+
+# 定义反变换函数
+boxcox_rev <- function(y, lambda) {
+  if (lambda == 0) exp(y) else (lambda*y + 1)^(1/lambda)
+}
+```
+
+```{r}
+## 函数，用一个滑动窗口，计算数据中的定量值的置信区间，返回一个dataframe, 每个列是一个相应的置信区间的数据，有一列"CI_%"作为不同置信区间的类别区分(横坐标为年龄)
+## 2024/12/03修改，已改为用百分位数估计代替正态估计
+get_CI <- function(data,CI,win_width,min_num){
+  CI2 <- as.numeric(gsub("%", "", CI)) / 100
+
+  qnorm_975 <- qnorm(0.975)
+  age_win <- c(-1:(win_width-2)) # 用一个长度为5的年龄数据窗口来做计算
+  df_temp <- data.frame(matrix(ncol = 5,nrow = 0))
+  colnames(df_temp) <- c("point_estimator","CI_upper","CI_lower","年龄","CI_%")
+  return_lst <- list(df_temp, df_temp, df_temp, df_temp, df_temp,df_temp, df_temp, df_temp, df_temp, df_temp) # 用于记录结果的列表果
+  
+  if (nrow(data)!=0){ # 只有在data数据量不为0的情况下才进行下列计算。
+    for (i in c(0:(max(data$年龄)-5))){
+      age_win <- age_win+1 # 年龄窗口逐渐移动
+      current_data <- data[which(data$年龄 %in% age_win),] # 当前数据窗口内的数据
+      if (nrow(current_data) < min_num){ # 如果窗口内样本量小于min_num，就没有继续计算的必要了
+        next
+      }
+      
+      current_result <- unlist(current_data$boxcox_result)
+      min_result <- current_result %>% min
+      max_result <- current_result %>% max
+      sd1 <- sd(current_result) # 当前数据窗口内的标准差
+      n <- nrow(current_data)
+      CI_num <- 0
+      for (j in CI2){
+        CI_num <- CI_num+1
+        z_value <-  qnorm(j) 
+        point_estimator <- quantile(current_result, j)
+        sd_of_CI <- (sd1^2/n+(sd1^2*z_value^2)/(2*n*(n-1)))^(1/2) # 对上下限CI标准差的估计值
+        CI_upper <- min(point_estimator+sd_of_CI*qnorm_975, max_result) # 置信区间上界的95%上界,控制不能太过大
+        CI_lower <- max(point_estimator-sd_of_CI*qnorm_975, min_result) # 置信区间上界的95%下界,控制不能太过小
+
+        lst_temp <- list(point_estimator, CI_upper, CI_lower, median(age_win), CI[[CI_num]])
+        return_lst[[CI_num]][nrow(return_lst[[CI_num]])+1,] <- lst_temp
+      }
+    } 
+  }
+  return(do.call(rbind, return_lst))
+}
+```
+
+```{r}
+# 函数，用于计算rq回归对数据分布的校正，并输出作图数据
+get_spline_result_data <- function(rq_formula, compare_data, rq_quantiles, indp_elements, baseline, knot_num, i){
+  
+  withProgress(message = '正在计算rq_regression', value = 0, {
+    # 计算分位数回归模型
+    rq_models <- lapply(1:length(rq_quantiles), function(j){
+      incProgress(1/length(rq_quantiles), detail = paste("\n 处理组别: ", i, " ", "rq_regression", j, "/", length(rq_quantiles)))
+      
+      rq(rq_formula, tau = rq_quantiles[[j]], data = compare_data) %>% suppressWarnings()
+    })
+    
+    # 创建预测数据
+    pred_data <- data.frame(
+      tau = unlist(rq_quantiles),
+      自变量水平 = indp_elements,
+      baseline
+    )
+    
+    # 获取预测值
+    pred_data$predicted_value <- lapply(rq_models, function(model){
+      predict(model, newdata = baseline) %>% unlist
+    })
+    
+    # 处理数据
+    processing_data <- pred_data[c("predicted_value", "tau")]
+    colnames(processing_data) <- c("x", "y")
+    processing_data$x <- unlist(processing_data$x)
+    processing_data$y <- unlist(processing_data$y)
+    
+    # 添加锚点
+    anchor_points <- data.frame(
+      x = c(0.00001, 10),
+      y = c(0, 1)
+    )
+    
+    # 合并数据
+    data_with_anchors <- rbind(processing_data, anchor_points)
+    
+    # 设置约束
+    con <- rbind(
+      c(0, 0.00001, 0),
+      c(0, 10, 1)
+    )
+    
+    # 确保数据按x排序
+    sorted_data <- data_with_anchors[order(data_with_anchors$x), ]
+    
+    # 计算每隔4个点的节点位置
+    n_points <- nrow(sorted_data)
+    knot_indices <- seq(1, n_points, by = 7)
+    
+    # 确保包含第一个和最后一个点（重要边界）
+    if (!1 %in% knot_indices) knot_indices <- c(1, knot_indices)
+    if (!n_points %in% knot_indices) knot_indices <- c(knot_indices, n_points)
+    
+    # 获取实际的x值作为节点
+    knots_custom <- sorted_data$x[knot_indices] %>% unique() %>% sort()
+    
+    # 确保节点数量在合理范围内
+    if (length(knots_custom) < 2) {
+      knots_custom <- quantile(sorted_data$x, probs = seq(0, 1, length.out = 3))
+    }
+    
+    # 使用自定义节点拟合COBS模型
+    spline_fit <- cobs(
+      x = sorted_data$x,
+      y = sorted_data$y,
+      constraint = "increase",
+      knots = knots_custom,  # 使用自定义节点
+      degree = 2,
+      lambda = 0
+    )
+
+    # 生成预测点
+    pred_x <- seq(min(processing_data$x), max(processing_data$x), length.out = 1000)
+    pred_y <- predict(spline_fit, pred_x)[, 2]
+    
+    # 计算导数
+    x_points <- seq(min(processing_data$x), max(processing_data$x), length.out = 1000)
+    dy_dx_smooth <- smooth_derivative(spline_fit, x_points, h_factor = 0.05)
+      
+    # 返回结果
+    return(list(
+      processing_data = processing_data,
+      pred_x = pred_x,
+      pred_y = pred_y,
+      dy_dx_smooth = dy_dx_smooth,
+      x_points = x_points,
+      rq_models = rq_models,
+      rq_quantiles = rq_quantiles
+    ))
+  })
+}
+```
+
+```{r}
+# 函数，对条样回归作图
+spline_plot_function <- function(processing_data, pred_x, pred_y){
+  
+  anchor_points <- data.frame(
+    x = c(0.00001, 10000),
+    y = c(0, 1)
+  )
+  
+  # 创建基础图形
+  p <- plot_ly() %>%
+    # 添加原始数据点
+    add_trace(
+      x = processing_data$x,
+      y = processing_data$y,
+      type = "scatter",
+      mode = "markers",
+      marker = list(size = 8, color = "black"),
+      name = "数据点",
+      hoverinfo = "x+y"
+    ) %>%
+    # 添加拟合样条线
+    add_trace(
+      x = pred_x,
+      y = pred_y,
+      type = "scatter",
+      mode = "lines",
+      line = list(color = "blue", width = 3),
+      name = "拟合样条"
+    )  %>%
+    # 设置布局
+    layout(
+      title = "带锚点的三次样条回归",
+      xaxis = list(title = "x"),
+      yaxis = list(title = "y"),
+      legend = list(
+        x = 0.01, 
+        y = 0.99,
+        bgcolor = "rgba(255,255,255,0.7)"
+      ),
+      hovermode = "closest"
+    )
+  
+  # 显示图形
+  p
+
+}
+```
+
+```{r}
+# 自适应绘图函数
+plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, extreme_quantiles) {
+  # 获取唯一群体和分位数
+  condition <- unique(data$condition)
+  quantiles <- unique(data$`CI_%`)
+  breaks_transformed <- pretty(origin_data$boxcox_result, 8)
+  breaks_original <- round(boxcox_rev(breaks_transformed, best_lambda) - 0.01, 2)
+  # 自动生成颜色方案
+  group_palette <- c("lightcoral", 
+                     "#66CCFF", 
+                     "#9AFF9A",    # 浅绿色 (与深绿色对应)
+                     "#FFD700",    # 浅金色 (与深棕色对应)
+                     "#DA70D6")    # 浅紫色 (与深紫色对应)
+  
+  quantile_palette <- c("brown",
+                        "darkblue", 
+                        "#006400",    # 深绿色 (与浅绿色同色调)
+                        "#8B4513",    # 深棕色 (与浅金色同色调)
+                        "#800080")    # 深紫色 (与浅紫色同色调)
+  color_multi <- ceiling(length(condition)/length(group_palette))
+  group_palette <- group_palette %>% rep(color_multi)
+  quantile_palette <- quantile_palette %>% rep(color_multi)
+  
+  # 创建基础图表
+  p <- plot_ly()
+  
+  # 第一步：添加原始数据点（散点图）
+  for (grp in condition) {
+    # 筛选该群体的原始数据
+    group_origin <- origin_data %>% filter(.data[[header_name]] == grp)
+    
+    if (nrow(group_origin) > 0) {
+      group_color <- group_palette[which(condition == grp)]
+      
+     # 添加原始数据点
+    p <- p %>% add_trace(
+      data = group_origin,
+      x = ~年龄,
+      y = ~boxcox_result,
+      type = "scatter",
+      mode = "markers",
+      name = paste(grp, nrow(group_origin), "例"),
+      marker = list(
+        color = paste0(
+          "rgba(", 
+          col2rgb(group_color)[1], ",", 
+          col2rgb(group_color)[2], ",", 
+          col2rgb(group_color)[3], ",0.3)"
+        ), # 半透明
+        size = 5
+      ),
+      hoverinfo = ifelse(input$hover_mode == "constant","text","none"),
+      text = ~ paste(
+        "群体: ", .data[[header_name]],
+        "<br>年龄: ", 年龄, "岁",
+        "；性别: ", 性别,
+        "<br>临床诊断: ", 临床诊断,
+        "<br>定量值: ", round(boxcox_rev(boxcox_result, best_lambda), 2)
+      ), 
+      legendgroup = paste0(grp, "_points"),
+      showlegend = TRUE
+    )
+
+    }
+  }
+  # 添加分位数折线（按群体分组）
+  for (grp in condition) {
+    group_data <- data %>% filter(condition == grp)
+    group_color <- group_palette[which(condition == grp)]
+    
+    for (q in quantiles) {
+      q_data <- group_data %>% filter(`CI_%` == q)
+      q_color <- quantile_palette[which(condition == grp)]
+      
+      # 添加折线
+      p <- p %>% add_trace(
+        data = q_data,
+        x = ~年龄,
+        y = ~point_estimator,
+        type = "scatter",
+        mode = "lines",
+        name = paste(grp, "分位数"),
+        hoverinfo = "text",  # 启用自定义悬停文本
+        text = ~paste(
+          "群体: ", condition,
+          " 年龄: ", 年龄, "岁",
+          `CI_%`, "分位数: ", round(boxcox_rev(point_estimator, best_lambda), 2)
+        ),
+        line = list(
+          shape = 'spline', 
+          smoothing = input$smoothing_value, # 平滑度
+          color = q_color,
+          width = 3 - 4*(abs(50 - as.numeric(gsub("%", "", q))))/100,
+          dash = ifelse(which(quantiles == q) %% 2 == 0, "dash", "solid")
+        ),
+        legendgroup = grp,
+        showlegend = which(quantiles == q) == 1 # 只为每个群体的第一条线显示图例
+      )
+      
+      if (q %in% extreme_quantiles) {
+      # 方法1：使用 error_y（垂直误差线）
+        p <- p %>% add_trace(
+          data = q_data,
+          x = ~年龄,
+          y = ~point_estimator,
+          type = "scatter",
+          mode = "markers",
+          error_y = list(
+            type = "data",
+            symmetric = FALSE,
+            array = ~CI_upper - point_estimator,
+            arrayminus = ~point_estimator - CI_lower,
+            color = q_color,
+            thickness = 0.5,
+            width = 0
+          ),
+          marker = list(size = 0.1, opacity = 0), # 隐藏点
+          showlegend = FALSE,
+          legendgroup = grp,
+          hoverinfo = "none"
+        )
+      }
+    }
+  }
+  
+  # 设置布局
+  p %>% layout(
+    hoverlabel = list(
+      font = list(
+        size = 16,  # 设置悬浮框字体大小
+        family = "Arial"
+      ),
+      bgcolor = "rgba(255,255,255,0.9)",  # 背景颜色
+      bordercolor = "#333",  # 边框颜色
+      namelength = -1  # 显示完整名称
+    ),
+    title = list(
+      text = paste0(input$dynamic_header_,"分层分位数趋势/散点图"),
+      y = 0.98,  # 向下移动标题位置 (0-1范围，1为顶部)
+      x = 0.5,   # 居中
+      xanchor = "center",
+      yanchor = "top",
+      font = list(
+        size = 25,  # 标题字体大小
+        family = "Arial"
+      )
+    ),
+    xaxis = list(
+      title = list(
+        text = "年龄 (岁)",
+        font = list(
+          size = 25,  # x轴标题字体大小
+          family = "Arial"
+        )
+      ),
+      tickfont = list(
+        size = 25,  # x轴刻度字体大小
+        family = "Arial"
+      )
+    ),
+    yaxis = list(
+      title = list(
+        text = "指标水平",
+        font = list(
+          size = 25,  # y轴标题字体大小
+          family = "Arial"
+        )
+      ),
+      tickfont = list(
+        size = 25,  # y轴刻度字体大小
+        family = "Arial"
+      ),
+      tickvals = breaks_transformed,
+      ticktext = breaks_original
+    ),
+    hovermode = input$hover_mode,
+    legend = list(
+      title = list(
+        text = "<b>各病人群体散点/分位数</b>",
+        font = list(size = 25)  # 图例标题字体大小
+      ),
+      font = list(size = 25),  # 图例项字体大小
+      itemsizing = "constant",
+      traceorder = "grouped"
+    ),
+    margin = list(
+      l = 50,  # 增加左边距给y轴标题更多空间
+      r = 20, 
+      b = 50,  # 增加底部边距给x轴标题更多空间
+      t = 50  # 增加顶部边距给主标题更多空间
+    )
+  )
+  
+}
+```
+
+```{r}
+# 函数，用于动态调整回归公式
+delete_var <- function(formular, deleted_var) {
+  # 输入验证：使用 inherits 更可靠
+  if (!inherits(formular, "formula")) {
+    stop("formular must be a formula object")
+  }
+  if (!is.character(deleted_var) || length(deleted_var) != 1) {
+    stop("deleted_var must be a single character string")
+  }
+  
+  # 将公式转换为 terms 对象进行解析
+  t <- terms(formular)
+  
+  # 获取所有预测变量项（不包括响应变量）
+  term_labels <- attr(t, "term.labels")
+  if (is.null(term_labels)) term_labels <- character(0)
+  
+  # 获取截距信息
+  has_intercept <- attr(t, "intercept") == 1
+  
+  # 处理每一项：检查是否包含目标变量
+  kept_terms <- character(0)
+  for (term in term_labels) {
+    # 使用 all.vars 提取表达式中的原始变量名
+    vars_in_term <- all.vars(as.formula(paste0("~", term)))
+    
+    # 如果该项不包含要删除的变量，则保留
+    if (!deleted_var %in% vars_in_term) {
+      kept_terms <- c(kept_terms, term)
+    }
+  }
+  
+  # 获取响应变量（左侧）
+  has_response <- attr(t, "response") == 1
+  if (has_response) {
+    response <- deparse(formular[[2]], width.cutoff = 500)
+  } else {
+    response <- NULL
+  }
+  
+  # 构建新的右侧表达式
+  if (length(kept_terms) == 0) {
+    predictors <- if (has_intercept) "1" else "0"
+  } else {
+    predictors <- paste(kept_terms, collapse = " + ")
+  }
+  
+  # 构造新公式
+  if (is.null(response)) {
+    new_formula_str <- paste("~", predictors)
+  } else {
+    new_formula_str <- paste(response, "~", predictors)
+  }
+  
+  # 返回公式对象
+  as.formula(new_formula_str)
+}
+
+return_validity_of_variables <- function(data, all_var_to_test){
+  validity_of_variables_lst <- lapply(all_var_to_test, function(var_to_test){
+    if (is.numeric(data[[var_to_test]]) || is.integer(data[[var_to_test]])){
+      validated_range <- c(quantile(data[[var_to_test]], 0.05), quantile(data[[var_to_test]], 0.95))
+      names(validated_range) <- c("lower_limit", "upper_limit")
+      validated_range
+    } else{
+      validated_var_lst <- data %>%
+        group_by(!!sym(var_to_test)) %>%
+        reframe(nrow = n()) %>%
+        arrange(desc(nrow)) %>%
+        filter(nrow >= 50)
+      
+      validated_var_lst[[var_to_test]] %>% unlist %>% list
+    }
+  })
+  names(validity_of_variables_lst) <- all_var_to_test
+  validity_of_variables_lst
+}
+```
+
+```{r}
+calculate_FWHM <- function(data) {
+  # 确保数据按x排序
+  data <- data.frame(
+    x = data$pred_x,
+    y = data$dy_dx_smooth
+  )
+  
+  data <- data[order(data$x), ]
+  x <- data$x
+  y <- data$y
+  
+  # 归一化y值使其成为概率密度函数(PDF)
+  total_area <- sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+  y_norm <- y / total_area
+  data$y_norm <- y_norm  # 添加归一化列
+  
+  # 找到所有峰值（局部最大值）
+  peaks <- which(diff(sign(diff(y_norm))) == -2) + 1
+  
+  # 如果没有找到峰值，返回NA
+  if (length(peaks) == 0) return(list(left = NA, right = NA, midpoint_height = NA, peak_height = NA))
+  
+  # 按峰值高度降序排列
+  peak_heights <- y_norm[peaks]
+  sorted_peaks <- peaks[order(peak_heights, decreasing = TRUE)]
+  
+  # 计算累积分布函数(CDF)
+  cdf <- cumsum(c(0, (diff(x) * (head(y_norm, -1) + tail(y_norm, -1)) / 2)))
+  
+  # 遍历每个峰值（从最高开始）
+  for (peak_idx in sorted_peaks) {
+    peak_height <- y_norm[peak_idx]
+    half_max <- peak_height / 2
+    
+    # 在左侧寻找半高宽点
+    left_idx <- peak_idx
+    while (left_idx > 1 && y_norm[left_idx] > half_max) {
+      left_idx <- left_idx - 1
+    }
+    
+    # 线性插值找到精确的左边界
+    if (left_idx < peak_idx) {
+      x_left <- approx(
+        x = y_norm[c(left_idx, left_idx + 1)],
+        y = x[c(left_idx, left_idx + 1)],
+        xout = half_max
+      )$y
+      if (half_max < min(y_norm[c(left_idx, left_idx + 1)])){x_left <- 0}
+    } else {
+      next  # 跳过无法找到左边界的峰值
+    }
+    
+    # 在右侧寻找半高宽点
+    right_idx <- peak_idx
+    while (right_idx < length(y_norm) && y_norm[right_idx] > half_max) {
+      right_idx <- right_idx + 1
+    }
+    
+    # 线性插值找到精确的右边界
+    if (right_idx > peak_idx) {
+      x_right <- approx(
+        x = y_norm[c(right_idx - 1, right_idx)],
+        y = x[c(right_idx - 1, right_idx)],
+        xout = half_max
+      )$y
+      if (half_max < min(y_norm[c(right_idx - 1, right_idx)])){x_right <- max(y_norm[c(right_idx - 1, right_idx)])}
+    } else {
+      next  # 跳过无法找到右边界的峰值
+    }
+    
+    # 计算FWHM区间内的PDF面积
+    idx_range <- which(x >= x_left & x <= x_right)
+    area_points <- c(x_left, x[idx_range], x_right)
+    y_points <- c(half_max, y_norm[idx_range], half_max)
+    
+    # 使用梯形法则计算面积
+    fwhm_area <- sum(diff(area_points) * (head(y_points, -1) + tail(y_points, -1)) / 2)
+    
+    # 检查面积是否超过35%
+    if (fwhm_area >= 0.35) {
+      # 计算FWHM中点
+      midpoint <- mean(c(x_left, x_right))
+      
+      # 计算中点高度
+      # 找到中点所在的区间
+      mid_idx <- findInterval(midpoint, x)
+      
+      # 确保在有效范围内
+      if (mid_idx >= 1 && mid_idx < length(x)) {
+        # 线性插值公式
+        x1 <- x[mid_idx]
+        x2 <- x[mid_idx + 1]
+        y1 <- y_norm[mid_idx]
+        y2 <- y_norm[mid_idx + 1]
+        
+        # 插值计算中点高度
+        midpoint_height <- y1 + (y2 - y1) * (midpoint - x1) / (x2 - x1)
+      } else {
+        # 如果中点超出范围，使用最近点
+        if (midpoint < min(x)) {
+          midpoint_height <- y_norm[1]
+        } else if (midpoint > max(x)) {
+          midpoint_height <- y_norm[length(y_norm)]
+        } else {
+          midpoint_height <- NA
+        }
+      }
+      
+      
+      equivalent_height <- fwhm_area/(x_right - x_left)
+      FWHM <- x_right - x_left
+      # 返回完整结果
+      return(
+        list(
+          left = x_left,
+          right = x_right,
+          midpoint = midpoint,
+          midpoint_height = midpoint_height,
+          peak_height = peak_height,
+          fwhm_area = fwhm_area,
+          equivalent_height = equivalent_height,
+          FWHM = FWHM,
+          equivalent_height_FWHM_ratio = equivalent_height/FWHM,
+          midpoint_height_FWHM_ratio = midpoint_height/FWHM
+        )
+      )
+    }
+  }
+  
+  # 如果没有峰值满足条件，返回NA
+  return(
+    list(
+      left = NA, 
+      right = NA, 
+      midpoint_height = NA,
+      peak_height = NA, 
+      fwhm_area = NA, 
+      equivalent_height = NA,
+      FWHM = NA,
+      equivalent_height_FWHM_ratio = NA,
+      midpoint_height_FWHM_ratio = NA
+    )
+  )
+}
+
+generate_quantiles_and_rq_models <- function(oringin_data) {
+  print(paste0("", oringin_data[["分层名称"]]))
+  
+  # 获取参数
+  rq_acc <- 0.001
+  rq_num <- max(min(ceiling(nrow(oringin_data)/5), 200), 25)
+  
+  # 定义非线性变换函数 (Beta分布)
+  # 使序列在两端更密集 (shape < 1)
+  nonlinear_seq <- function(n, lower, upper, shape = 0.1) {
+    u <- seq(0, 1, length.out = n)
+    # Beta累积分布函数的反函数 (两端密集)
+    q <- qbeta(u, shape, shape)
+    # 缩放至目标区间
+    lower + q * (upper - lower)
+  }
+  
+  # 生成序列1：基于定量结果的极端值 (非线性变换)
+  n_points <- ceiling(rq_num*1)
+  target_range <- c(
+    quantile(oringin_data[["数据"]]$定量结果, rq_acc),
+    quantile(oringin_data[["数据"]]$定量结果, 1 - rq_acc)
+  )
+  
+  # 在定量结果范围内生成非线性序列
+  dense_x <- nonlinear_seq(n_points, target_range[1], target_range[2])
+  seq1 <- unlist(lapply(dense_x, get_quantile_position, data = oringin_data[[1]]$定量结果))
+  
+  # 生成序列2：极端分位数位置 (非线性变换)
+  seq2 <- nonlinear_seq(n_points, rq_acc, 1 - rq_acc)
+  
+  # 合并并去重
+  combined <- c(seq1, seq2) %>% unique() %>% sort()
+  # showNotification(paste("生成点数:", length(combined)))
+  
+  rq_models <- lapply(1:length(combined), function(j){
+    rq(oringin_data[["回归公式"]], tau = combined[[j]], data = oringin_data[["数据"]]) %>% suppressWarnings()
+  })
+  
+  return(list(
+    "数据" = oringin_data[["数据"]],  # 回归数据
+    "分层名称" = oringin_data[["分层名称"]],  # 颜色组名
+    "有效协变量" = oringin_data[["有效协变量"]],
+    "回归公式" = oringin_data[["回归公式"]],
+    "分位数位置" = combined, 
+    "rq_models" = rq_models  
+  ))
+}
+
+# 最简实现：计算一个值在数据集中的分位数位置
+get_quantile_position <- function(data, value) {
+  # 计算小于等于给定值的样本数
+  le_count <- sum(data <= value)
+  # 计算小于给定值的样本数
+  lt_count <- sum(data < value)
+  # 总样本数
+  n <- length(data)
+  # 使用标准分位数定义 (Type 7，R默认)
+  position <- (le_count + lt_count) / (2 * n)
+  return(position)
+}
+
+# 筛选所有当前基线水平下活跃的分层 
+filter_active_stratifications_data <- function(baseline, data_to_cal){
+  for (i in colnames(baseline)) {
+    
+    for (j in seq_along(data_to_cal)){
+      
+      if (data_to_cal[[j]] %>% is.na %>% all){
+        next
+      }
+      
+      baseline_level <- baseline[[i]] %>% unlist
+      
+      testing_level <- data_to_cal[[j]][["有效协变量"]][[i]] %>% unlist
+      
+      if (all(is.numeric(testing_level))){
+        test_result <-  (baseline_level >= testing_level[["lower_limit"]] & baseline_level <= testing_level[["upper_limit"]]) 
+      }else{
+        test_result <- (baseline_level %in% testing_level)
+      }
+      if (!test_result){
+        data_to_cal[[j]] <- NA
+      }
+    }
+  }
+  location <- which(!is.na(data_to_cal))
+  
+  data_to_cal[location]
+}
+
+smooth_derivative <- function(fit, x_points, h_factor = 0.001, shrink_factor = 0.1) {
+  # 使用四分位距(IQR)标准化步长
+  x_iqr <- IQR(x_points, na.rm = TRUE)
+  h_base <- h_factor * x_iqr
+  
+  # 确定前0.2%区域的边界
+  x_sorted <- sort(x_points)
+  threshold <- x_sorted[ceiling(0.002 * length(x_sorted))]
+  
+  # 计算自适应步长向量
+  h_values <- ifelse(x_points < threshold, shrink_factor * h_base, h_base)
+  
+  # 初始化导数向量
+  dy_dx <- numeric(length(x_points))
+  
+  # 计算中心差分
+  for (i in seq_along(x_points)) {
+    x <- x_points[i]
+    h <- h_values[i]
+    
+    # 边界保护
+    x_left <- max(x - h, min(x_points))
+    x_right <- min(x + h, max(x_points))
+    
+    # 使用平滑预测
+    y_left <- predict(fit, x_left)[, 2]
+    y_right <- predict(fit, x_right)[, 2]
+    
+    dy_dx[i] <- abs((y_right - y_left) / (x_right - x_left))
+  }
+  
+  return(dy_dx)
+}
+
+spline_regression_and_smooth_derivative <- function(data, baseline){
+  rq_quantiles <- data[["分位数位置"]] 
+  rq_models <- data[["rq_models"]]
+
+  # 获取预测值
+  predicted_value <- lapply(rq_models, function(model){
+    predict(model, newdata = baseline) %>% unlist
+  })
+  
+  # 创建预测数据
+  pred_data <- data.frame(
+    "tau" = unlist(rq_quantiles) %>% unname(),
+    "predicted_value" = predicted_value %>% unlist %>% unname()
+  )
+  # 处理数据
+  processing_data <- pred_data[c("predicted_value", "tau")]
+  colnames(processing_data) <- c("x", "y")
+  processing_data$x <- unlist(processing_data$x)
+  processing_data$y <- unlist(processing_data$y)
+  # 添加锚点
+  anchor_points <- data.frame(
+    x = c(0.00001, 10),
+    y = c(0, 1)
+  )
+  # 合并数据
+  data_with_anchors <- rbind(processing_data, anchor_points)
+  # 设置约束
+  con <- rbind(
+    c(0, 0.00001, 0),
+    c(0, 10, 1)
+  )
+  # 确保数据按x排序
+  sorted_data <- data_with_anchors[order(data_with_anchors$x), ]
+  # 计算每隔4个点的节点位置
+  n_points <- nrow(sorted_data)
+  knot_indices <- seq(1, n_points, by = 7)
+  # 确保包含第一个和最后一个点（重要边界）
+  if (!1 %in% knot_indices) knot_indices <- c(1, knot_indices)
+  if (!n_points %in% knot_indices) knot_indices <- c(knot_indices, n_points)
+  # 获取实际的x值作为节点
+  knots_custom <- sorted_data$x[knot_indices] %>% unique() %>% sort()
+  # 确保节点数量在合理范围内
+  if (length(knots_custom) < 2) {
+    knots_custom <- quantile(sorted_data$x, probs = seq(0, 1, length.out = 3))
+  }
+  # 使用自定义节点拟合COBS模型
+  spline_fit <- cobs(
+    x = sorted_data$x,
+    y = sorted_data$y,
+    constraint = "increase",
+    knots = knots_custom,  # 使用自定义节点
+    degree = 2,
+    lambda = 0
+  )
+  # 生成预测点
+  pred_x <- seq(min(processing_data$x), max(processing_data$x), length.out = 1000)
+  pred_y <- predict(spline_fit, pred_x)[, 2]
+  # 计算导数
+  x_points <- seq(min(processing_data$x), max(processing_data$x), length.out = 1000)
+  dy_dx_smooth <- smooth_derivative(spline_fit, x_points, h_factor = 0.05)
+  # 返回结果
+  return(list(
+    processing_data = processing_data,
+    pred_x = pred_x,
+    pred_y = pred_y,
+    dy_dx_smooth = dy_dx_smooth,
+    x_points = x_points,
+    rq_models = rq_models,
+    rq_quantiles = rq_quantiles
+  ))
+}
+
+all_pairs <- function(vec) {
+  # 输入验证
+  if (!is.vector(vec)) stop("输入必须是向量")
+  if (any(duplicated(vec))) stop("向量包含重复元素")
+  
+  n <- length(vec)
+  # 处理边界情况
+  if (n < 2) {
+    message("向量长度小于2，无法形成组合")
+    return(data.frame(Var1 = character(0), Var2 = character(0)))
+  }
+  
+  # 计算组合数量
+  num_combinations <- choose(n, 2)
+  
+  # 创建结果数据框
+  result <- data.frame(
+    Var1 = rep(NA, num_combinations),
+    Var2 = rep(NA, num_combinations),
+    stringsAsFactors = FALSE
+  )
+  
+  # 填充组合
+  idx <- 1
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      result$Var1[idx] <- vec[i]
+      result$Var2[idx] <- vec[j]
+      idx <- idx + 1
+    }
+  }
+  
+  return(result)
+}
+
+# 计算box-cox最佳λ - 完全避免环境问题
+# 直接使用数值向量而不是数据框
+maxlikelihood_boxcox <- function(data_vector){
+  
+  y_values <- as.numeric(data_vector) + 0.1
+  # 手动实现Box-Cox优化
+  lambda_seq <- seq(-2, 2, by = 0.05)
+  log_likelihoods <- sapply(lambda_seq, function(lambda) {
+    if (lambda == 0) {
+      y_trans <- log(y_values)
+    } else {
+      y_trans <- (y_values^lambda - 1) / lambda
+    }
+    
+    # 计算对数似然
+    n <- length(y_trans)
+    var_y <- var(y_trans)
+    if (is.na(var_y)) return(-Inf)
+    if (var_y == 0) return(-Inf)  # 避免零方差
+    
+    -n/2 * log(var_y) + (lambda - 1) * sum(log(y_values))
+  })
+  
+  # 找到最佳lambda
+  best_idx <- which.max(log_likelihoods)
+  best_lambda <- lambda_seq[best_idx]
+  
+  # 利用最优λ进行正态转换
+  data_vector_return <- if (best_lambda == 0) {
+    log(as.numeric(data_vector) + 0.1)
+  } else {
+    ((as.numeric(data_vector) + 0.1)^best_lambda - 1) / best_lambda
+  }
+  data_vector_return
+}
+
+calculate_SDR <- function(grouped_data) {
+  # 合并所有数据
+  rbind_data <- do.call(rbind, grouped_data)
+  total_sd <- sd(rbind_data$定量结果)
+  
+  # 计算各组均值的标准差（更直接的“组间标准差”）
+  group_means <- sapply(grouped_data, function(x) mean(x$定量结果))
+  sd_between_groups <- sd(group_means)
+  
+  # 返回原始SDR和方差占比
+  return(sd_between_groups / total_sd)
+}
+
+# 计算两组间Cohen's d效应量
+cohens_d <- function(group1, group2) {
+  # 输入验证
+  if (length(group1) < 2 || length(group2) < 2) {
+    stop("每组至少需要2个观测值")
+  }
+  
+  # 计算组统计量
+  n1 <- length(group1)
+  n2 <- length(group2)
+  mean1 <- mean(group1)
+  mean2 <- mean(group2)
+  sd1 <- sd(group1)
+  sd2 <- sd(group2)
+  
+  # 计算合并标准差
+  pooled_sd <- sqrt(((n1 - 1) * sd1^2 + (n2 - 1) * sd2^2) / (n1 + n2 - 2))
+  
+  # 计算Cohen's d
+  d <- (mean1 - mean2) / pooled_sd
+  
+  return(d)
+}
+
+cut_data_age <- function(data, cut_points, SDR = 1){
+  
+  cut_points <- c(min(data$年龄), cut_points, max(data$年龄))
+  return_data <- lapply(1:(length(cut_points) - 1), function(i, data){
+    data %>% filter(年龄 >= cut_points[[i]], 年龄 < cut_points[[i + 1]])
+  },
+  data = data)
+  names(return_data) <- lapply(1:(length(cut_points) - 1), function(i){
+    paste0(cut_points[[i]],"~",cut_points[[i + 1]]-1)
+  }) %>% unlist
+  
+  return_data
+}
+
+generate_segments <- function(n, m, x, mini_distance = 5) {
+  # 处理无效输入
+  if (n > m || x < 0 || mini_distance < 1) {
+    return(list())
+  }
+  
+  # 若无需分段点
+  if (x == 0) {
+    return(list(integer(0)))
+  }
+  
+  # 计算年龄范围
+  age_range <- m - n + 1
+  
+  # 如果可选点数不足
+  if (age_range < x) {
+    return(list())
+  }
+  
+  # 生成所有可能的组合
+  age_sequence <- n:m
+  combinations <- combn(age_sequence, x, simplify = FALSE)
+  
+  # 如果不需要最小间隔，直接返回所有组合
+  if (mini_distance == 1) {
+    return(combinations)
+  }
+  
+  # 过滤函数：检查组合是否满足最小间隔要求
+  satisfies_mini_distance <- function(combination) {
+    combination_ <- c(n,combination,m)
+    
+    # 如果只有一个点，总是满足条件
+    if (length(combination_) == 2) {
+      return(TRUE)
+    }
+    
+    # 检查所有相邻点之间的间隔
+    for (i in 1:(length(combination_) - 1)) {
+      if (combination_[i + 1] - combination_[i] < mini_distance) {
+        return(FALSE)
+      }
+    }
+    return(TRUE)
+  }
+  
+  # 应用过滤函数
+  filtered_combinations <- Filter(satisfies_mini_distance, combinations)
+  
+  return(filtered_combinations)
+}
+
+series_of_segment <- function(data, segment_num, mini_distance){
+  min_age <- min(data$年龄) %>% na.omit()
+  max_age <- max(data$年龄) %>% na.omit()
+  # 初始切割位置
+  all_possible_cut_points <- generate_segments(min_age, max_age, segment_num, mini_distance)
+  
+  return(all_possible_cut_points)
+}
+
+split_by_sex <- function(data){
+  male <- data %>% filter(性别 == "男")
+  female <- data %>% filter(性别 == "女")
+  return(list("Male" = male, "Female" = female))
+}
+
+# 对数据进行所有可能的分段点的年龄、性别分段，并计算SDR
+return_SDR_lst <- function(all_possible_cut_points, data, indicator_names){
+  # 先进行正态转换
+  data$定量结果 <- maxlikelihood_boxcox(data$定量结果)
+  sex_stra_status <- list()
+  SDR_list <- list()
+  
+  
+  for (i in seq_along(all_possible_cut_points)){ # 遍历所有可能的分段点
+    if (i %% 100 == 0){print(paste0(indicator_names, " ", i))} # 每100个点print一下，方便跟进计算进度
+    
+    sex_stra_status[[i]] <- list()
+    cut_points <- all_possible_cut_points[[i]] # 提取本数据所有可能的分段点
+    cut_data <- cut_data_age(data, cut_points) # 对本数据进行年龄分割
+    
+    for (j in seq_along(cut_data)){ # 判断每个层级是否需要年龄分段
+      male <- cut_data[[j]] %>% filter(性别 == "男")
+      female <- cut_data[[j]] %>% filter(性别 == "女")
+      sex_SDR <- calculate_SDR(list(male, female))
+      if (is.na(sex_SDR)){
+        sex_stra_status[[i]][[j]] <- FALSE
+      }else if (sex_SDR > 0.3){
+        sex_stra_status[[i]][[j]] <- TRUE
+      } else{sex_stra_status[[i]][[j]] <- FALSE}
+    }
+    
+    if (any(sex_stra_status[[i]] %>% unlist)){ # 如需要年龄分段，则进行年龄分层，并计算SDR
+      group_num_to_split <- which(sex_stra_status[[i]] %>% unlist)
+      add_df <- lapply(ifelse(length(group_num_to_split)>1,cut_data[group_num_to_split],cut_data[group_num_to_split]), split_by_sex)[[1]]
+      cut_data <- c(cut_data[-group_num_to_split], add_df)
+    }
+    
+    if (any(lapply(cut_data, nrow) %>% unlist < 1000)){ # 如果任何分层样本量小于1000,则放弃该分层方案
+      SDR_list[[i]] <- NA
+      next
+    }
+    
+    SDR_list[[i]] <- calculate_SDR(cut_data)
+  }
+  return(
+    list(
+      "age_cutoff_points" = all_possible_cut_points, 
+      "corresponding_SDR" = SDR_list, 
+      "sex_stratification_status" = sex_stra_status
+    )
+  )
+}
+
+# 函数返回最优SDR
+
+
+return_best_SDR <- function(stra_result_lst){
+  age_cutoff_points <- list()
+  corresponding_SDR <- list()
+  sex_stratification_status <- list()
+  for (stra_result in stra_result_lst){
+    age_cutoff_points <- c(age_cutoff_points, stra_result[["age_cutoff_points"]])
+    corresponding_SDR <- c(corresponding_SDR, stra_result[["corresponding_SDR"]])
+    sex_stratification_status <- c(sex_stratification_status, stra_result[["sex_stratification_status"]])
+  }
+  
+  age_cutoff_points_lst <- lapply(seq_along(age_cutoff_points), function(i){
+    (age_cutoff_points[[i]] %>% length) + (sex_stratification_status[[i]] %>% unlist %>% which %>% length)
+  })
+  num_cut_points <- age_cutoff_points_lst %>% unique %>% unlist %>% sort(decreasing = TRUE)
+  
+  for (i in num_cut_points){
+    current_SDR_lst <- corresponding_SDR[which(age_cutoff_points_lst == i)]
+    max_SDR <- current_SDR_lst %>% unlist %>% na.omit %>% max
+    if (max_SDR >= 0.2){
+      max_SDR_location <- which(corresponding_SDR %>% unlist == max_SDR)[[1]] 
+      return(
+        list(
+          "best_age_cutoff_point" = age_cutoff_points[[max_SDR_location]],
+          "best_SDR" = corresponding_SDR[[max_SDR_location]],
+          "sex_stratification_status" = sex_stratification_status[[max_SDR_location]]      
+        )
+      )      
+      
+    } 
+  }
+  
+  max_SDR_location <- 1
+  
+  return(
+    list(
+      "best_age_cutoff_point" = age_cutoff_points[[max_SDR_location]],
+      "best_SDR" = corresponding_SDR[[max_SDR_location]],
+      "sex_stratification_status" = sex_stratification_status[[max_SDR_location]]      
+    )
+  )
+}
+
+
+statify_data <- function(data, best_stratified_data_by_SDR){
+  result_set1 <- data %>% cut_data_age(., best_stratified_data_by_SDR[["best_age_cutoff_point"]] %>% unlist)
+  sex_stratification_status <- best_stratified_data_by_SDR[["sex_stratification_status"]]
+  best_SDR <- best_stratified_data_by_SDR[["best_SDR"]]
+  
+  result_set2 <- list()
+  for (i in seq_along(result_set1)){
+    if (sex_stratification_status[[i]]){
+      result_set2[[names(result_set1)[[i]]]] <- split_by_sex(result_set1[[i]])
+    }else{
+      result_set2[[names(result_set1)[[i]]]] <- list("Male&Female" = result_set1[[i]])
+    }
+  }
+  result_set2
+}
+
+safe_date_convert <- function(x) {
+  tryCatch({
+    # 首先尝试直接作为POSIXct转换
+    result <- as.POSIXct(x, tz = "UTC")
+  }, error = function(e) {
+    # 如果直接转换失败，尝试Excel日期转换
+    tryCatch({
+      numeric_value <- as.numeric(x)
+      as.POSIXct("1899-12-30", tz = "UTC") + ddays(numeric_value)
+    }, error = function(e2) {
+      # 如果两种方法都失败，返回NA
+      return(as.POSIXct(NA))
+    })
+  })
+}
+```
+
+```{r, include=FALSE}
+# posi_headers <- c(
+#   "医院名称", "开单科室", "病人类型", "样本类型", "试剂厂家", 
+#   "方法学",   "项目名称", "项目序号", "性别",     "临床诊断", 
+#   "备注信息", "定性结果", "定量结果", "年龄",     "采样时间", 
+#   "类别_关键词","类别_无监督","年龄_离散","定量结果_离散"
+# )
+
+# 响应式数据加载
+reactive_data_na_ <- reactiveVal()
+# 顺序参数
+order_para <- reactiveVal(1)
+and_lst_ <- reactiveVal()
+not_lst_ <- reactiveVal()
+not_limit_lst_ <- reactiveVal()
+global_nested_data <- reactiveVal()
+
+grouping_table <- reactiveVal(NULL)
+grouping_table2 <- reactiveVal(NULL)
+
+Saved_Class_name <- reactiveVal("")
+Saved_And1 <- reactiveVal("")
+Saved_And2 <- reactiveVal("")
+Saved_And3 <- reactiveVal("")
+Saved_Not <- reactiveVal("")
+Saved_Not_limit <- reactiveVal("")
+Saved_selected_exclude_group <- reactiveVal("")
+embedding_matrix <- reactiveVal()
+wk <- reactiveVal()
+data2 <- reactiveVal()
+global_regression_formula1 <- reactiveVal()
+global_regression_formula2 <- reactiveVal()
+reactive_dataset_to_plots <- reactiveValues()
+global_dataset_to_plots <- reactiveValues()
+plots_waiting_to_download <- reactiveValues()
+global_nested_data_ready <- reactiveVal()
+global_data_to_cal <- reactiveVal()
+reactive_baseline <- reactiveVal()
+filtered_data_to_cal <- reactiveVal() 
+global_result_table <- reactiveVal() 
+
+
+# 初始化空数据框架
+empty_df <- matrix(nrow = 0, ncol = 1) %>% data.frame
+colnames(empty_df) <- c("")
+reactive_data_na_(empty_df)
+
+get_data <- function (location_lst){
+  list_return <- list()
+  for (i in location_lst){
+    list_return[[length(list_return)+1]] <- read_excel(i)
+  }
+  return(list_return)
+}
+
+output$data_upload_stat <- renderText("请上传数据")
+
+# 文件上传处理
+observeEvent(input$read_data, {
+  req(input$Input_data)
+  
+  showNotification("正在读取数据...", type = "message")
+  # 读取上传文件
+  df <- input$Input_data$datapath %>% get_data %>% do.call(rbind, .) 
+  
+  # 将所有NA都转化为"NA"
+  df <- as.data.frame(
+    lapply(df, function(col) {
+      col = as.character(col) %>% replace(is.na(.), "NA")
+    }),
+    stringsAsFactors = FALSE 
+  )
+  
+  # 更新响应式数据
+  reactive_data_na_(df)
+  output$data_upload_stat <- renderText("数据已上传")
+  showNotification("数据上传完成", type = "message")
+})
+
+# 数据中的NA值处理
+output$abnormal_result_filters <- renderUI({
+  req(reactive_data_na_())
+  validate(need(nrow(reactive_data_na_())>0, message = "请上传数据"))
+  
+  wellPanel(
+    style = "padding: 5px; border-radius: 5px;",  # 添加圆角和内边距
+    h4("缺失值/无效值筛选器", 
+       style = "margin-top: 0; margin-bottom: 15px; color: #2c3e50; font-weight: 600;"),  # 改进标题样式
+    
+    div(
+      # 每个选项添加更清晰的标签和说明
+      div(
+        style = "display: flex; align-items: center;",
+        checkboxInput(
+          "invalid_date_filter", 
+          label = span("过滤无效日期", style = "font-weight: 600; font-size: 18px;"),
+          value = TRUE
+        )
+      ),
+      
+      div(
+        style = "display: flex; align-items: center;",
+        checkboxInput(
+          "invalid_age_filter", 
+          label = span("过滤无效年龄", style = "font-weight: 600; font-size: 18px;"),
+          value = TRUE
+        )
+      ),
+      
+      div(
+        style = "display: flex; align-items: center;",
+        checkboxInput(
+          "invalid_result_filter",
+          label = span("过滤无效定量结果", style = "font-weight: 600; font-size: 18px;"),
+          value = TRUE
+        )
+      )
+    )
+  )
+
+})
+
+reactive_data <- reactive({
+  req(reactive_data_na_())
+  
+  validate(need(nrow(reactive_data_na_())>0, message = ""))
+  validate(need(!is.null(input$invalid_date_filter), message = ""))
+  validate(need(!is.null(input$invalid_age_filter), message = ""))
+  validate(need(!is.null(input$invalid_result_filter), message = ""))
+  
+  na_results <- c("结果无效", "NA")
+  data <- reactive_data_na_()
+  if (input$invalid_date_filter == TRUE){
+    data <- data %>% filter(!(采样时间 %in% na_results))
+    data <- data %>% mutate(采样时间 = safe_date_convert(采样时间))
+  }
+  if (input$invalid_age_filter == TRUE){
+    data <- data %>% filter(!(年龄 %in% na_results))
+    data <- data %>% mutate(年龄 = as.numeric(年龄))
+  }
+  if (input$invalid_result_filter == TRUE){
+    data <- data %>% filter(!(定量结果 %in% na_results))
+    data <- data %>% mutate(定量结果 = as.numeric(定量结果))
+  }
+  data
+}) %>% debounce(1000)
+
+# 更换图例顺序
+observeEvent(input$change_order,{
+  order_para(order_para()*(-1))
+})
+
+output$filters <- renderUI({
+  req(reactive_data())
+  validate(need(nrow(reactive_data())>0, message = "当前数据集中剔除NA值后无数据"))
+  df <- reactive_data()
+  posi_headers <- colnames(df)
+  wellPanel(
+    style = "padding: 15px; border-radius: 5px;",  # 添加圆角和内边距
+    h4("变量筛选器", style = "margin-top: 0; margin-bottom: 15px; color: #2c3e50; font-weight: 600;"),
+    lapply(posi_headers, function(col) {
+      values <- unique(df[[col]])
+      n_unique <- length(values)
+      if (length(unique(df[[col]])) %in% c(1, 0)){
+        return(NULL)
+      }
+      if (is.numeric(df[[col]])) {
+        sliderInput(
+          inputId = paste0("filter_", col),
+          label = col,
+          min = floor(min(df[[col]] %>% na.omit())),
+          max = ceiling(max(df[[col]] %>% na.omit())),
+          value = range(df[[col]] %>% na.omit())
+        )
+      } else {
+          if (col=="采样时间" & input$invalid_date_filter==TRUE){
+            dateRangeInput(
+              paste0("filter_", col),
+              "选择采样时间范围:",
+              start = min(reactive_data()$采样时间),
+              end = max(reactive_data()$采样时间),
+              language = "zh-CN"
+            )
+          } else if (n_unique > 200) {
+            return(NULL)
+          } else {
+            
+            # 普通列使用常规选择器
+            pickerInput(
+              inputId = paste0("filter_", col),
+              label = col,
+              choices = values,
+              selected = values,
+              multiple = TRUE,
+              options = list(`actions-box` = TRUE)
+            )
+          }
+      }
+    })
+  )
+})
+
+
+output$download_html_ui <- renderUI({
+  validate(need(length(names(plots_waiting_to_download)) > 0, message = ""))
+  wellPanel(
+    style = "padding: 15px; border-radius: 5px;",  # 添加圆角和内边距
+    h4(".html可交互图像下载", style = "margin-top: 0; margin-bottom: 15px; color: #2c3e50; font-weight: 600;"),
+    
+    fluidRow(
+      column(
+        12,
+        pickerInput(
+          inputId = "html_download_selecter",
+          label = "选择下载图片名称",
+          choices = names(plots_waiting_to_download),
+          selected = "饼图",
+          multiple = FALSE,
+          options = list(`actions-box` = TRUE)
+        )
+      ),
+      column(
+        12,
+        downloadButton("download_html_plot", "下载.html可交互图")
+      )
+    )
+
+  )
+})
+
+output$download_html_plot <- downloadHandler(
+  filename = function() {
+    paste0(format(Sys.time(), "%Y%m%d"), input$html_download_selecter, ".html")
+  },
+  content = function(file) {
+    # 获取当前数据
+    data_to_save <- reactiveValuesToList(reactive_dataset_to_plots)
+    
+    # 添加元数据
+    attr(data_to_save, "metadata") <- list(
+      created = Sys.time(),
+      user = ifelse(exists("USER"), USER, "unknown"),
+      app_version = "1.2.0"
+    )
+    saveWidget(
+      plots_waiting_to_download[[input$html_download_selecter]],
+      file = file
+    )
+  }
+)
+
+reactive({
+  req(reactive_data())
+  validate(need(nrow(reactive_data())>0, message = ""))
+  # 动态更新科室选项
+  departments <- reactive_data() %>%
+    count(开单科室) %>%
+    arrange(desc(n)) %>%
+    pull(开单科室)
+  
+  updateSelectInput(
+    session, 
+    "department",
+    choices = departments,
+    selected = departments[1:3]
+  )
+  
+  # 动态更新采样时间范围
+  updateDateRangeInput(
+    session,
+    "date_range",
+    start = min(df$采样时间),
+    end = max(df$采样时间)
+  )
+  
+  # 动态更新年龄范围
+  updateSliderInput(
+    session,
+    "age_range",
+    min = floor(min(df$年龄)),
+    max = ceiling(max(df$年龄)),
+    value = c(floor(min(df$年龄)), ceiling(max(df$年龄)))
+  )
+})
+```
+
+# 数据上传
+
+```{r}
+div(
+  fileInput(
+    inputId = "Input_data",
+    label = "请上传需要分析的数据（Excel文件）",
+    multiple = TRUE,
+    accept = c(".xlsx"),
+    width = "100%"
+  ),
+  actionButton("read_data", "确认上传数据", icon = icon("upload")),
+  textOutput("data_upload_stat") %>% tagAppendAttributes(style = "color: #4DAF4A; font-weight: 500;margin-top: 31px;")
+)
+```
+
+# 聚类工具
+
+## Outputs {.tabset}
+
+### 关键词聚类 {data-height=1500}
+
+```{r}
+fluidRow(
+  column(2, uiOutput("choose_grouping_col"))
+)
+```
+
+#### {.boxed data-height=2000}
+
+```{r}
+fluidRow(
+  style = "height: 1500px; display: flex;",  # 关键1：设置外层高度和flex
+  
+  # 左侧列 - 聚类情况
+  column(6,
+         style = "display: flex; flex-direction: column; height: 80%;",
+         div(style = "flex: 1; min-height: 0;",  # 关键2：min-height: 0 允许收缩
+             DT::dataTableOutput("diag_count", width = "100%")
+         )
+  ),
+  
+  column(6, 
+         style = "display: flex; flex-direction: column; height: 100%;",
+         
+         # 上半部分：条件输入
+         div(style = "flex: 1; min-height: 0; display: flex; flex-direction: column;",  # 关键3：内部flex
+             fluidRow(
+               column(12,
+                      h4("关键词聚类条件输入", style="text-align: center;"),
+                      # 关键4：使用div包裹并设置高度
+                      div(style = "flex: 1; overflow: auto;",
+                          uiOutput("word_grouping_ui", height = "100%"))
+               )
+             )
+         ),
+         
+         # 下半部分：可视化
+         div(style = "flex: 1; min-height: 0;",
+             fluidRow(
+               column(12,
+                      h4("可视化结果", style="text-align: center;"),
+                      # 关键5：确保可视化组件有高度
+                      div(style = "height: 100%;",
+                          plotly::plotlyOutput("visualization_plot", height = "100%")
+                      )
+               )
+             )
+         )
+  )
+)
+
+```
+
+### 词向量无监督聚类 {data-height=1800}
+
+```{r}
+fluidRow(
+  column(2, uiOutput("choose_grouping_col2")),
+  column(10, uiOutput("diag_kmeans_ui"))
+)
+fluidRow(
+  style = "height: 1600px; display: flex;",  
+  column(12,
+         style = "display: flex; flex-direction: column; height: 80%;",
+         div(
+           style = "flex: 1; display: flex; flex-direction: column; min-height: 0;", 
+           h4("当前无监督聚类情况"),
+           DT::dataTableOutput("diag_count2"))  
+  )
+)
+```
+
+
+
+# 分析工具
+
+## 侧边栏 {.sidebar data-width=500}
+
+```{r}
+uiOutput("abnormal_result_filters")
+uiOutput("filters")
+uiOutput("download_html_ui")
+```
+
+## Outputs {.tabset}
+
+### 数值变量离散化 {data-height=2500}
+
+```{r}
+div(style = "display: flex; flex-direction: column; height: 100vh; min-height: 2500px;",
+  # 控制行 - 固定高度
+  div(style = "flex: 0 0 auto; padding: 10px; background: #f8f9fa; border-bottom: 1px solid #ddd;",
+      uiOutput("choose_continuous_col_ui", style = "width: 100%;")
+  ),
+  
+  # 表格区域 - 两列并排
+  div(style = "flex: 1; max-height: 65vh; display: flex;",
+      # 左侧表格
+      div(style = "flex: 1; min-width: 0; padding: 10px; display: flex; flex-direction: column;",
+          h6("原数据分布可视化", style = "text-align: center; margin-top: 0;"),
+          div(style = "flex: 1; min-height: 0; overflow: auto; border: 1px solid #eee; border-radius: 4px;", uiOutput("oringin_data_visualization_ui", height = "100%"))
+      ),
+      
+      # 右侧表格
+      div(style = "flex: 1; max-height: 65vh; padding: 10px; display: flex; flex-direction: column;",
+          h6("原数据分位数表格", style = "text-align: center; margin-top: 0;"),
+          div(style = "flex: 1; min-height: 0; overflow: auto; border: 1px solid #eee; border-radius: 4px;", DT::dataTableOutput("oringin_data_form", height = "100%", width = "100%"))
+      )
+  ),
+  
+  div(style = "flex: 1; max-height: 65vh; display: flex;",
+      # 左侧表格
+      div(style = "flex: 1; min-width: 0; padding: 10px; display: flex; flex-direction: column;",
+          h6("离散数据可视化", style = "text-align: center; margin-top: 0;"),
+          div(style = "flex: 1; min-height: 0; overflow: auto; border: 1px solid #eee; border-radius: 4px;", plotlyOutput("discretized_data_visualization", height = "100%"))
+      ),
+      
+      # 右侧表格
+      div(style = "flex: 1; max-height: 65vh; padding: 10px; display: flex; flex-direction: column;",
+          h6("各离散组数量/比例表格", style = "text-align: center; margin-top: 0;"),
+          div(style = "flex: 1; min-height: 0; overflow: auto; border: 1px solid #eee; border-radius: 4px;", DT::dataTableOutput("discretized_data_form_ui", height = "100%"))
+      )
+  )
+)
+```
+
+```{r}
+output$choose_continuous_col_ui <- renderUI({
+  req(filtered_data())
+  div(
+    fluidRow(
+      column(2, selectInput("chosed_continuous_col", "离散化变量", choices = colnames(reactive_data()), selected = "定量结果", width = "100%")),
+      column(6, textInput("cut_points", "输入分割点，以“|”分隔", placeholder = "如：“20|50|80|100 或 5%|30%|60%|95%”", value = "5%|30%|50%|70%|95%", width = "100%")),
+      
+      column(4, div(style = "margin-top: 31px;", actionButton("cut_continuous_data", "确认分割，覆盖数据", width = "100%")))
+    ),
+    fluidRow(
+      column(12, textOutput("text_group_names") %>% tagAppendAttributes(style = "color: #4DAF4A; font-weight: 500;"))
+    )
+  )
+  
+})
+
+output$oringin_data_visualization_ui <- renderUI({
+  req(filtered_data())
+  req(input$chosed_continuous_col)
+  
+  div(
+    style = "display: flex; flex-direction: column; height: 100%;",
+    fluidRow(
+      column(4, selectInput("select_transform", "正态变换",choices = c("原数据", "Box-Cox"), selected = "原数据")),
+      column(4, numericInput("bin_num", "直方数量",min = 1, max = 999999, value = 50))
+    ),
+    fluidRow(
+      style = "flex: 1; min-height: 0;",  # 关键：允许图表扩展
+      column(12, 
+             style = "height: 100%;",  # 确保列也有高度
+             plotlyOutput("original_distribution_plot", height = "100%")
+      )
+    )    
+  )
+})
+```
+
+```{r}
+discretize_percent <- function(numeric_input, numeric_percent){
+  group_lst <- rep(NA, length(numeric_input)) %>% unlist
+  for (i in 1:(length(numeric_percent)-1)){
+    start_percent <- numeric_percent[[i]]
+    stop_percent <- numeric_percent[[i + 1]]
+    interval_name <- paste0(paste0(start_percent*100,"%"), "~", paste0(stop_percent*100,"%"))
+    location <- which(numeric_input >= quantile(numeric_input, start_percent) & numeric_input <= quantile(numeric_input, stop_percent))
+    group_lst[location] <- interval_name
+  }
+  group_lst
+}
+
+discretize_numeric<- function(numeric_input, numeric_cut_points){
+  group_lst <- rep(NA, length(numeric_input)) %>% unlist
+  for (i in 1:(length(numeric_cut_points)-1)){
+    start_value <- numeric_cut_points[[i]]
+    stop_value <- numeric_cut_points[[i + 1]]
+    interval_name <- paste0(start_value, "~", stop_value)
+    location <- which(numeric_input >= start_value & numeric_input <= stop_value)
+    group_lst[location] <- interval_name
+  }
+  group_lst
+}
+
+boxcox_rev <- function(y, lambda) {
+  if (lambda == 0) exp(y) else (lambda*y + 1)^(1/lambda)
+}
+```
+
+```{r}
+# 后端
+
+# 输入原始值，用filtered_data()与分析工具版块保持一致逻辑
+df <- reactive({
+  req(filtered_data())
+  req(input$chosed_continuous_col)
+  df <- data.frame(original_value = filtered_data()[[input$chosed_continuous_col]])
+  if (nrow(df>0)){
+    df$trasformed_value <- df$original_value  
+  }
+  df  
+})
+
+cut_points_info <- reactive({
+  req(df())
+  if (!is.numeric(df()$original_value)){
+    text_group_names <- paste0(input$chosed_continuous_col, "不是数值变量")
+    return(
+      list(
+        "cut_points" = "NA", 
+        "df" = "NA", 
+        "group_levels" = "NA", 
+        "text_group_names" = text_group_names,
+        "pattern" = "NA"
+      )
+    )
+  }
+  
+  df_ <- df()
+  if (is.na(input$cut_points)){
+    cut_points <- c()
+  }else{
+    cut_points <- input$cut_points %>% strsplit(split = "|", fixed = TRUE) %>% unlist %>% trimws %>% unique 
+  }
+  
+  # 结构化输入
+  if (length(cut_points)==0){
+    pattern <-  "NA"
+  }else if (all(grepl("%$", cut_points))){
+    numeric_percent <- gsub("%", "", cut_points) %>% as.numeric()
+    numeric_percent <- numeric_percent/100
+    if (!any(is.na(numeric_percent))){
+      pattern = "%"
+    }else{pattern = "NA"}
+  }else{
+    numeric_cut_points <- cut_points %>% as.numeric()
+    if (!any(is.na(numeric_cut_points))){
+      pattern = "numeric"
+    }else{pattern = "NA"}
+  }
+  
+  if (pattern == "%"){
+    cut_points <- c("0%", cut_points, "100%") 
+    numeric_percent <- c(0, numeric_percent, 1)[which(c(0, numeric_percent, 1)<=1 & c(0, numeric_percent, 1)>=0)] %>% sort %>% unique 
+    df_$discreted_group <- df_$original_value %>% discretize_percent(numeric_percent)
+    df_ <- df_ %>% arrange(original_value)
+    group_levels <- df_$discreted_group %>% unique
+    text_group_names <- paste(df_$discreted_group %>% unique, collapse = ", ")
+    text_group_names <- paste0("按", input$chosed_continuous_col, "分位数分组：", text_group_names)
+  }else if (pattern == "numeric"){
+    numeric_cut_points <- c(df_$original_value %>% min, numeric_cut_points, df_$original_value %>% max) %>% unique %>% sort
+    df_$discreted_group <- df_$original_value %>% discretize_numeric(numeric_cut_points)
+    df_ <- df_ %>% arrange(original_value)
+    group_levels <- df_$discreted_group %>% unique
+    text_group_names <- paste(df_$discreted_group %>% unique, collapse = ", ")
+    text_group_names <- paste0("按", input$chosed_continuous_col, "数值分组：", text_group_names)
+  }else if (pattern == "NA"){
+    text_group_names <- paste0("请输入正确的分段信息，以“|”分割区间段，支持数值或百分位数")
+    return(
+      list(
+        "cut_points" = "NA", 
+        "df" = "NA", 
+        "group_levels" = "NA", 
+        "text_group_names" = text_group_names,
+        "pattern" = "NA"
+      )
+    )
+  }
+  return(
+    list(
+      "cut_points" = cut_points, 
+      "df" = df_, 
+      "group_levels" = group_levels, 
+      "text_group_names" = text_group_names,
+      "pattern" = pattern
+    )      
+  )
+
+})
+ 
+observeEvent(input$cut_continuous_data,{
+  # 更新分段后数据
+  validate(need(cut_points_info()[["text_group_names"]] != paste0(input$chosed_continuous_col, "不是数值变量"), message = ""))
+  if (cut_points_info()[["text_group_names"]] == paste0(input$chosed_continuous_col, "不是数值变量")) {
+    return()
+  }
+  
+  data <- filtered_data()[, which(colnames(filtered_data()) != paste0(input$chosed_continuous_col, "_离散"))]
+  
+  table1 <- cut_points_info()$df[,c("original_value","discreted_group")] %>% distinct()
+  colnames(table1) <- c(input$chosed_continuous_col, paste0(input$chosed_continuous_col, "_离散"))
+
+  col_order <- c(colnames(data), paste0(input$chosed_continuous_col, "_离散"))
+  new_data <- merge(data, table1, by = input$chosed_continuous_col, all = TRUE)
+  new_data <- new_data[, col_order]
+  
+  reactive_data_na_(new_data)
+})
+
+
+output$text_group_names <- renderText({
+  req(cut_points_info())
+  cut_points_info()[["text_group_names"]]
+})
+
+observe({
+  req(input$select_transform)
+  req(df())
+  validate(need(cut_points_info()[["pattern"]] != "NA", message = ""))
+  df <- df()
+  
+  if (input$select_transform == "Box-Cox"){
+    # 计算box-cox最佳λ - 完全避免环境问题
+    # 直接使用数值向量而不是数据框
+    df$trasformed_value <- as.numeric(df$trasformed_value) + 0.1
+    y_values <- df$trasformed_value
+    # 手动实现Box-Cox优化
+    lambda_seq <- seq(-2, 2, by = 0.05)
+    log_likelihoods <- sapply(lambda_seq, function(lambda) {
+      if (lambda == 0) {
+        y_trans <- log(y_values)
+      } else {
+        y_trans <- (y_values^lambda - 1) / lambda
+      }
+      
+      # 计算对数似然
+      n <- length(y_trans)
+      var_y <- var(y_trans)
+      if (is.na(var_y)) return(-Inf)
+      if (var_y == 0) return(-Inf)  # 避免零方差
+      
+      -n/2 * log(var_y) + (lambda - 1) * sum(log(y_values))
+    })
+    
+    # 找到最佳lambda
+    best_idx <- which.max(log_likelihoods)
+    best_lambda <- lambda_seq[best_idx]
+    
+    # 利用最优λ进行正态转换
+    df$trasformed_value <- if (best_lambda == 0) {
+      log(y_values)
+    } else {
+      ((y_values)^best_lambda - 1) / best_lambda
+    }
+  }
+  
+  breaks_transformed <- pretty(df$trasformed_value, 8)
+  breaks_original <- if(input$select_transform == "Box-Cox"){
+    round(boxcox_rev(breaks_transformed, best_lambda) - 0.01, 2)
+  }else{
+    breaks_transformed
+  }
+  
+  # 计算分位数
+  quantile_5 <- quantile(df$trasformed_value, probs = 0.05, na.rm = TRUE)
+  quantile_33 <- quantile(df$trasformed_value, probs = 0.33, na.rm = TRUE)
+  quantile_66 <- quantile(df$trasformed_value, probs = 0.66, na.rm = TRUE)
+  quantile_95 <- quantile(df$trasformed_value, probs = 0.95, na.rm = TRUE)
+  
+  # 创建颜色映射函数（暗色调）
+  get_color <- function(x) {
+    purple <- "rgb(80, 0, 80)"
+    dark_blue <- "rgb(0, 0, 139)"      # 暗蓝色
+    dark_green <- "rgb(0, 100, 0)"     # 暗绿色  
+    dark_red <- "rgb(139, 0, 0)"       # 暗红色
+    
+    if (x <= quantile_5){
+      return(purple)
+    } else if (x <= quantile_33) {
+      # 蓝色到绿色的渐变
+      ratio <- (x - quantile_5) / (quantile_33 - quantile_5)
+      # 紫色 (80,0,80) 到 蓝色 (0,0,139)
+      r <- as.integer(80 - 80 * ratio)   # 从80降到0
+      g <- 0
+      b <- as.integer(80 + (139 - 80) * ratio)  # 从80升到139
+      return(sprintf("rgb(%d, %d, %d)", r, g, b))
+    } else if (x <= quantile_66) {
+      # 蓝色到绿色的渐变
+      ratio <- (x - quantile_33) / (quantile_66 - quantile_33)
+      r <- 0
+      g <- as.integer(100 * ratio)
+      b <- as.integer(139 * (1 - ratio))
+      return(sprintf("rgb(%d, %d, %d)", r, g, b))
+    } else {
+      # 绿色到红色的渐变
+      ratio <- (x - quantile_66) / (max(df$trasformed_value, na.rm = TRUE) - quantile_66)
+      r <- as.integer(139 * ratio)
+      g <- as.integer(100 * (1 - ratio))
+      b <- 0
+      return(sprintf("rgb(%d, %d, %d)", r, g, b))
+    }
+  }
+
+  # 创建直方图数据
+  hist_data <- hist(df$trasformed_value, plot = FALSE, breaks = input$bin_num)
+  if (input$select_transform == "Box-Cox" && exists("best_lambda")) {
+    hist_data$breaks_original <- round(boxcox_rev(hist_data$breaks, best_lambda) - 0.01, 2)
+  } else {
+    hist_data$breaks_original <- hist_data$breaks
+  }
+    
+  
+  # 为每个柱子分配颜色
+  bin_centers <- (hist_data$breaks[-1] + hist_data$breaks[-length(hist_data$breaks)]) / 2
+  bar_colors <- sapply(bin_centers, get_color)
+  
+  # 计算CDF（累积分布函数）信息
+  cdf_values <- ecdf(df$trasformed_value)(hist_data$breaks[-1])
+  cdf_counts <- cdf_values * length(df$trasformed_value)
+  
+  
+  # 创建hover文本
+  hover_text <- sprintf(
+    "数值范围: %.2f-%.2f<br>频数: %d<br>小于等于该值的样本数: %.0f (%.1f%%)",
+    hist_data$breaks_original[-length(hist_data$breaks_original)],
+    hist_data$breaks_original[-1],
+    hist_data$counts,
+    cdf_counts,
+    cdf_values * 100
+  )    
+  
+  # 绘制渐变色直方图
+  p <- plot_ly() %>%
+    add_bars(
+      x = hist_data$mids,
+      y = hist_data$counts,
+      marker = list(
+        color = bar_colors,
+        line = list(color = "rgba(0,0,0,0.3)", width = 1)
+      ),
+      name = "频数分布",
+      hoverinfo = "text",
+      hovertext = hover_text
+    ) %>%
+    layout(
+      title = list(
+        text = paste0(input$chosed_continuous_col, "原数据频数分布直方图"),
+        x = 0.5,
+        font = list(size = 16, color = "black")
+      ),
+      xaxis = list(
+        title = "数值大小",
+        gridcolor = "lightgray",
+        zerolinecolor = "lightgray",
+        tickvals = breaks_transformed,
+        ticktext = breaks_original
+      ),
+      yaxis = list(
+        title = paste0(input$chosed_continuous_col, "原数据频数"),
+        gridcolor = "lightgray",
+        zerolinecolor = "lightgray"
+      ),
+      plot_bgcolor = "white",
+      paper_bgcolor = "white",
+      showlegend = FALSE
+    )
+  
+  # 添加分位数参考线
+  quantile_lines <- list(
+    list(value = quantile_5, color = "purple", label = "5%"),
+    list(value = quantile_33, color = "blue", label = "33%"),
+    list(value = quantile_66, color = "green", label = "66%"),
+    list(value = quantile_95, color = "red", label = "95%")
+  )
+  
+  for (q_line in quantile_lines) {
+    p <- p %>%
+      add_segments(
+        x = q_line$value, xend = q_line$value,
+        y = 0, yend = max(hist_data$counts) * 0.95,
+        line = list(color = q_line$color, dash = "dot", width = 1.5),
+        hoverinfo = "none",
+        name = paste0(q_line$label, "分位数")
+      ) %>%
+      add_annotations(
+        x = q_line$value,
+        y = max(hist_data$counts) * 0.95,
+        text = q_line$label,
+        showarrow = FALSE,
+        bgcolor = "rgba(255,255,255,0.9)",
+        font = list(color = q_line$color, size = 10),
+        hoverinfo = "none",
+        xanchor = "center"
+      )
+  }
+  
+  output$original_distribution_plot <- renderPlotly({
+    validate(need(cut_points_info()[["pattern"]] != "NA", message = ""))
+    plots_waiting_to_download[[paste0(input$chosed_continuous_col, "原数据频数分布直方图")]] <- p
+    p
+  })
+})
+
+output$oringin_data_form <- DT::renderDataTable({
+  validate(need(cut_points_info()[["pattern"]] != "NA", message = ""))
+  req(df())
+  quantile_lst <- lapply(seq(0, 1, 0.05),function(i){
+    quantile(df()$original_value, i)
+  })
+
+  original_distribution_table <- data.frame(
+    "分位数" = names(quantile_lst %>% unlist),
+    "数值" = unlist(quantile_lst) %>% unname,
+    "小于等于该值的样本数" = lapply(unlist(quantile_lst) %>% unname, function(i){
+      length(which(df()$original_value <= i))
+    }) %>% unname() %>% unlist
+  )      
+  
+  DT::datatable(
+    original_distribution_table,
+    extensions = c('Buttons'),  # 移除了Scroller扩展
+    options = list(
+      pageLength = 40,  # 每页显示20行
+      dom = 'lfrtip', # 移除多余按钮
+      paging = FALSE,  # 启用分页
+      searching = FALSE,  # 启用搜索框
+      ordering = FALSE,  # 启用排序
+      info = FALSE,  # 显示分页信息
+      autoWidth = FALSE,  # 自动调整列宽
+      language = list(
+        url = '//cdn.datatables.net/plug-ins/1.13.6/i18n/zh.json'  # 中文语言包
+      )
+    ),
+    rownames = FALSE,
+    width = "100%",       # 设置表格宽度为100%
+    style = "bootstrap"   # 使用bootstrap样式
+  )
+})
+
+output$discretized_data_visualization <- renderPlotly({
+  validate(need(cut_points_info()[["pattern"]] != "NA", message = ""))
+  pattern <- cut_points_info()[["pattern"]]
+  
+  df <- cut_points_info()$df
+  
+  # 计算每个分组的频数
+  group_counts <- table(df$discreted_group) %>% 
+    as.data.frame() %>%
+    rename(Group = Var1, Count = Freq)
+  
+  group_counts$Group <- factor(group_counts$Group, levels = cut_points_info()$group_levels)
+  
+  # 创建hover文本
+  hover_text_group <- sprintf(
+    "分组: %s<br>频数: %d<br>占比: %.1f%%",
+    group_counts$Group,
+    group_counts$Count,
+    group_counts$Count / nrow(df) * 100
+  )
+  
+  # 绘制分组直方图
+  p_group <- plot_ly(
+    data = group_counts,
+    x = ~Group,
+    y = ~Count,
+    type = "bar",
+    marker = list(
+      color = "rgb(112, 112, 112)" ,
+      line = list(color = "rgba(0,0,0,0.3)", width = 1)
+    ),
+    hoverinfo = "text",
+    hovertext = hover_text_group
+  ) %>%
+    layout(
+      title = list(
+        text = paste0(input$chosed_continuous_col, "分组分布直方图"),
+        x = 0.5,
+        font = list(size = 16, color = "black")
+      ),
+      xaxis = list(
+        title = "分组",
+        gridcolor = "lightgray",
+        zerolinecolor = "lightgray",
+        tickangle = -45  # 倾斜x轴标签避免重叠
+      ),
+      yaxis = list(
+        title = paste0(input$chosed_continuous_col, "各分组频数"),
+        gridcolor = "lightgray",
+        zerolinecolor = "lightgray"
+      ),
+      plot_bgcolor = "white",
+      paper_bgcolor = "white",
+      showlegend = FALSE,
+      margin = list(b = 100)  # 增加底部边距以容纳倾斜的标签
+    )
+  
+  # 添加统计信息注解
+  p_group <- p_group %>%
+    add_annotations(
+      x = 0.02,
+      y = 0.98,
+      xref = "paper",
+      yref = "paper",
+      text = paste(
+        sprintf("分组方式: %s<br>分组数量: %d<br>总样本数: %d", 
+                ifelse(pattern == "%", "百分比分组", 
+                       ifelse(pattern == "numeric", "数值切点分组", "未分组")),
+                nrow(group_counts),
+                nrow(df))
+      ),
+      showarrow = FALSE,
+      bgcolor = "rgba(255,255,255,0.8)",
+      bordercolor = "black",
+      borderwidth = 1,
+      font = list(size = 10),
+      align = "left",
+      xanchor = "left",
+      yanchor = "top"
+    )
+  
+  plots_waiting_to_download[[paste0(input$chosed_continuous_col, "分组分布直方图")]] <- p_group
+  
+  p_group
+})
+
+output$discretized_data_form_ui <- DT::renderDataTable({
+  validate(need(cut_points_info()[["pattern"]] != "NA", message = ""))
+  pattern <- cut_points_info()[["pattern"]]
+  
+  df <- cut_points_info()$df
+  
+  if (pattern == "%"){
+    groups_distribution_table <- df %>% 
+      group_by(discreted_group) %>% 
+      reframe(Count = n(), lower = min(original_value) %>% round(2), upper = max(original_value) %>% round(2)) %>% 
+      rename(组名 = discreted_group, 样本量 = Count, 定量下界 = lower, 定量上界 = upper) %>% arrange(定量下界)
+  }else{
+    groups_distribution_table <- df %>% 
+      group_by(discreted_group) %>% 
+      reframe(
+        Count = n(), 
+        lower = min(original_value) %>% get_quantile_position(df$original_value, .) ,
+        upper = max(original_value) %>% get_quantile_position(df$original_value, .)
+      ) %>% 
+      rename(
+        组名 = discreted_group, 
+        样本量 = Count, 
+        分位数下界 = lower, 
+        分位数上界 = upper
+      ) %>% arrange(分位数下界)
+      
+    groups_distribution_table <- groups_distribution_table %>% mutate(
+      分位数下界 = paste0((分位数下界 %>% round(4))*100, "%"),
+      分位数上界 = paste0((分位数上界 %>% round(4))*100, "%")
+    )
+    
+    groups_distribution_table[1,]$分位数下界 <- "0.00%"
+    groups_distribution_table[nrow(groups_distribution_table),]$分位数上界 <- "100.00%"
+  }
+
+  DT::datatable(
+    groups_distribution_table,
+    extensions = c('Buttons'),  # 移除了Scroller扩展
+    options = list(
+      pageLength = 40,  # 每页显示20行
+      dom = 'lfrtip', # 移除多余按钮
+      paging = FALSE,  # 启用分页
+      searching = FALSE,  # 启用搜索框
+      ordering = FALSE,  # 启用排序
+      info = FALSE,  # 显示分页信息
+      autoWidth = FALSE,  # 自动调整列宽
+      language = list(
+        url = '//cdn.datatables.net/plug-ins/1.13.6/i18n/zh.json'  # 中文语言包
+      )
+    ),
+    rownames = FALSE,
+    width = "100%",       # 设置表格宽度为100%
+    style = "bootstrap"   # 使用bootstrap样式
+  )
+})
+
+
+
+```
+
+
+### 探索性定性分层分析 {data-height=3000}
+
+```{r}
+fluidRow(
+  column(2, uiOutput("dynamic_controls")),
+  column(2, selectInput("hash_color", "颜色模式", 
+                      choices = c("默认颜色", "哈希颜色"), 
+                      selected = "默认颜色",
+                      width = "100%")),
+  column(2, selectInput("age_grain", "年龄颗粒度", 
+                      choices = c("1", "2", "3", "4", "5", "10", "12", "15", "20"), 
+                      selected = "3",
+                      width = "100%")),
+  column(2, selectInput("time_grain", "时间颗粒度", 
+                      choices = c("month", "week", "day"), 
+                      selected = "month",
+                      width = "100%")),
+  column(2, 
+         div(style = "margin-top: 31px;",  # 添加垂直对齐的间距
+             actionButton(
+               "change_order", "改变图例顺序", 
+               icon = icon("refresh"),
+               class = "btn-default",
+               width = "100%"
+             )
+         )
+  )
+)
+
+fluidRow(
+  style = "height: 2200px; display: flex; flex-wrap: nowrap;",  # 添加 nowrap
+  
+  # 左半区 - 3个图表
+  column(6, 
+         style = "display: flex; flex-direction: column; height: 100%; padding: 10px;",
+         div(style = "flex: 1; min-height: 0; display: flex; flex-direction: column;",
+             div(style = "flex: 1.5; min-height: 0; padding: 5px;",
+                 plotly::plotlyOutput("pie_plot", height = "100%")
+             ),
+             div(style = "flex: 1; min-height: 0; padding: 5px;",
+                 plotly::plotlyOutput("age_mount_plot", height = "100%")
+             ),
+             div(style = "flex: 1; min-height: 0; padding: 5px;",
+                 plotly::plotlyOutput("time_mount_plot", height = "100%")
+             )
+         )
+  ),
+  
+  # 右半区 - 3个图表
+  column(6, 
+         style = "display: flex; flex-direction: column; height: 100%; padding: 10px;",
+         div(style = "flex: 1; min-height: 0; display: flex; flex-direction: column;",
+             div(style = "flex: 1.5; min-height: 0; padding: 5px;",
+                 uiOutput("pie_plot2_with_console", height = "100%")
+             ),
+             div(style = "flex: 1; min-height: 0; padding: 5px;",
+                 plotly::plotlyOutput("age_ratio_plot", height = "100%")
+             ),
+             div(style = "flex: 1; min-height: 0; padding: 5px;",
+                 plotly::plotlyOutput("time_ratio_polt", height = "100%")
+             )
+         )
+  )
+)
+
+
+```
+
+
+### 探索性定量分层分析 {data-height=2700}
+
+```{r}
+div(  # 外层 flex 容器
+  style = "display: flex; flex-direction: column; height: 100vh; min-height: 800px;",
+  
+  # 控制行 - 固定高度
+  div(style = "flex: 0 0 auto; padding: 10px; background: #f8f9fa; border-bottom: 1px solid #ddd;",
+      fluidRow(
+        column(2, uiOutput("dynamic_header")),
+        column(2, selectInput("hover_mode", "悬停模式", choices = c("x unified","constant"), selected = "x unified", width = "100%")),
+        column(2, selectInput("CI_for_plot", "分位数曲线", choices = c("99%","95%","90%","80%","50%","20%","10%","5%","1%"), selected = c("95%","80%","50%","20%","5%"), multiple = TRUE, width = "100%")),
+        column(2, sliderInput("smoothing_value", "平滑度", min = 0, max = 1.3, value = 1.3, step = 0.01, width = "100%")),
+        column(2, sliderInput("win_width", "年龄窗口", min = 1, max = 29, value = 5, step = 2, width = "100%")),
+        column(2, sliderInput("min_num", "最小样本量", min = 1, max = 100, value = 20, step = 1, width = "100%"))
+      )
+  ),
+  
+  div(
+      style = "flex: 1; min-height: 0; padding: 10px; display: flex; flex-direction: column; align-items: center;",
+      div(
+        style = "width: min(130vh, 100%); aspect-ratio: 1.4 / 0.8; border: 1px solid #eee; border-radius: 4px; background: white;",
+        plotly::plotlyOutput("quantiles_plot", height = "100%", width = "100%")
+      )
+    )
+  
+)
+
+```
+
+### 异质性数据分布分析与参考区间 {data-height=20000}
+
+```{r}
+div(
+  style = "display: flex; flex-direction: column; height: 100vh; min-height: 2500px;",
+  # 控制行 - 固定高度
+  div(
+    style = "flex: 0 0 auto; padding: 10px; background: #f8f9fa; border-bottom: 1px solid #ddd;",
+    uiOutput("kde_distribution_analysis_ui", style = "width: 100%;")
+  ),
+  div(
+    style = "flex: 1; min-height: 0; padding: 10px; display: flex; flex-direction: column; align-items: center;",
+    div(
+      style = "width: min(140vh, 100%); height: 65vh; border: 1px solid #eee; border-radius: 4px; background: white;",
+      plotly::plotlyOutput("sample_size_plot", height = "100%", width = "100%"),
+      fluidRow(column(12, uiOutput("qr_distribution_estimation")))
+    )
+  )  
+)
+```
+
+### 分位数回归协方差分析 {data-height=2700}
+
+```{r}
+div(style = "display: flex; flex-direction: column; height: 100vh; min-height: 2500px;",
+  # 控制行 - 固定高度
+  div(style = "flex: 0 0 auto; padding: 10px; background: #f8f9fa; border-bottom: 1px solid #ddd;",
+      uiOutput("qr_regression", style = "width: 100%;")
+  ),
+  
+  # 表格区域 - 两列并排
+  div(style = "flex: 1; max-height: 50vh; display: flex;",
+      # 左侧表格
+      div(style = "flex: 1; min-width: 0; padding: 10px; display: flex; flex-direction: column;",
+          h4("协变量回归(第一次回归)模型摘要", style = "text-align: center; margin-top: 0;"),
+          div(style = "flex: 1; min-height: 0; overflow: auto; border: 1px solid #eee; border-radius: 4px;",
+              DT::dataTableOutput("first_regression_table", height = "100%")
+          )
+      ),
+      
+      # 右侧表格
+      div(style = "flex: 1; max-height: 50vh; padding: 10px; display: flex; flex-direction: column;",
+          h4("自变量回归(第二次回归)模型摘要", style = "text-align: center; margin-top: 0;"),
+          div(style = "flex: 1; min-height: 0; overflow: auto; border: 1px solid #eee; border-radius: 4px;",
+              DT::dataTableOutput("second_regression_table", height = "100%")
+          )
+      )
+  ),
+  
+  div(
+    style = "flex: 1; min-height: 0; padding: 10px; display: flex; flex-direction: column; align-items: center;",
+    h4("自变量组间比较", style = "text-align: center; margin-top: 0;"),
+    div(
+      style = "width: min(140vh, 100%); aspect-ratio: 1.4 / 1; border: 1px solid #eee; border-radius: 4px; background: white;",
+      plotly::plotlyOutput("comparison_plot", height = "100%", width = "100%")
+    )
+  )
+)
+```
+
+
+# 当前数据
+
+```{r}
+downloadButton(outputId = paste0("downloadButton"),label = "下载当前数据")
+output$"downloadButton" <- downloadHandler(
+  filename = function(){
+    paste0("当前数据_", Sys.Date(), ".xlsx")
+  },
+  content = function(file){
+    showNotification("正在写出文件，需要几秒钟...", type = "message")
+    write.xlsx(reactive_data(),file, na.string = "NA")
+    showNotification("写出完成", type = "message")
+  }
+)
+```
+
+
+当前数据 {data-height=1000}
+------------------------------------
+```{r}
+DT::dataTableOutput("raw_data_table", height = "80vh")
+```
+
+```{r 服务器逻辑}
+# 动态生成控制组件
+output$dynamic_controls <- renderUI({
+  req(reactive_data())
+  validate(need(nrow(reactive_data())>0, message = ""))
+  
+  tagList(
+    selectInput("header_for_stack",
+                "一级分层变量",
+                choices = colnames(reactive_data())[-which(colnames(reactive_data()) %in% c("采样时间", "项目序号", "病人ID", "检验单号", "年龄", "临床诊断", "参考区间", "定量结果", "原始结果", "调研人"))],
+                selected = "定性结果")
+  )
+})
+
+# 动态生成控制组件
+output$dynamic_header <- renderUI({
+  req(reactive_data())
+  validate(need(nrow(reactive_data())>0, message = ""))
+  tagList(
+    selectInput(
+      "dynamic_header_",
+      "颜色代表的分层变量",
+      choices = colnames(reactive_data()),
+      selected = "性别"
+    )
+  )
+})
+
+# 响应式数据过滤
+filtered_data <- reactive({
+  req(reactive_data())
+  validate(need(nrow(reactive_data())>0, , message = ""))
+  data <- reactive_data()
+  
+  if (!is.null(input[[paste0("filter_", "采样时间")]]) & input$invalid_date_filter == TRUE) {
+    data <- data %>% filter(
+      采样时间 >= input[[paste0("filter_", "采样时间")]][1],
+      采样时间 <= input[[paste0("filter_", "采样时间")]][2]
+    )
+  }
+  
+  if (input$invalid_age_filter == TRUE) {
+    data <- data[which(data$年龄!="NA"),]
+    data$年龄 <- data$年龄 %>% as.numeric()
+    data <- data %>% filter(
+      年龄 >= input[[paste0("filter_", "年龄")]][1],
+      年龄 <= input[[paste0("filter_", "年龄")]][2]
+    )
+  }else if (length(unique(reactive_data()$年龄)) <= 200 & length(unique(reactive_data()$年龄)) > 1){
+    data <- data %>% filter(年龄 %in% input[[paste0("filter_", "年龄")]])
+  }
+  
+  if (input$invalid_result_filter == TRUE) {
+    data <- data[which(data$定量结果!="结果无效"),]
+    data$定量结果 <- data$定量结果 %>% as.numeric()
+    data <- data %>% filter(
+      定量结果 >= input[[paste0("filter_", "定量结果")]][1],
+      定量结果 <= input[[paste0("filter_", "定量结果")]][2]
+    )
+  }else if (length(unique(reactive_data()$定量结果)) <= 200 & length(unique(reactive_data()$定量结果)) > 1){
+    data <- data %>% filter(定量结果 %in% input[[paste0("filter_", "定量结果")]])
+  }
+  
+  if (!is.null(input[[paste0("filter_", "医院名称")]])) {
+    data <- data %>% filter(医院名称 %in% input[[paste0("filter_", "医院名称")]])
+  }
+  if (!is.null(input[[paste0("filter_", "开单科室")]])) {
+    data <- data %>% filter(开单科室 %in% input[[paste0("filter_", "开单科室")]])
+  }
+  if (!is.null(input[[paste0("filter_", "病人类型")]])) {
+    data <- data %>% filter(病人类型 %in% input[[paste0("filter_", "病人类型")]])
+  }
+  if (!is.null(input[[paste0("filter_", "样本类型")]])) {
+    data <- data %>% filter(样本类型 %in% input[[paste0("filter_", "样本类型")]])
+  }
+  if (!is.null(input[[paste0("filter_", "试剂厂家")]])) {
+    data <- data %>% filter(试剂厂家 %in% input[[paste0("filter_", "试剂厂家")]])
+  }
+  if (!is.null(input[[paste0("filter_", "方法学")]])) {
+    data <- data %>% filter(方法学 %in% input[[paste0("filter_", "方法学")]])
+  }
+  if (!is.null(input[[paste0("filter_", "项目名称")]])) {
+    data <- data %>% filter(项目名称 %in% input[[paste0("filter_", "项目名称")]])
+  }
+  if (!is.null(input[[paste0("filter_", "项目序号")]])) {
+    data <- data %>% filter(项目序号 %in% input[[paste0("filter_", "项目序号")]])
+  }
+  if (!is.null(input[[paste0("filter_", "性别")]])) {
+    data <- data %>% filter(性别 %in% input[[paste0("filter_", "性别")]])
+  }
+  if (!is.null(input[[paste0("filter_", "临床诊断")]])) {
+    data <- data %>% filter(临床诊断 %in% input[[paste0("filter_", "临床诊断")]])
+  }
+  if (!is.null(input[[paste0("filter_", "备注信息")]])) {
+    data <- data %>% filter(备注信息 %in% input[[paste0("filter_", "备注信息")]])
+  }
+  if (!is.null(input[[paste0("filter_", "定性结果")]])) {
+    data <- data %>% filter(定性结果 %in% input[[paste0("filter_", "定性结果")]])
+  }
+  if (!is.null(input[[paste0("filter_", "类别_关键词")]])) {
+    data <- data %>% filter(`类别_关键词` %in% input[[paste0("filter_", "类别_关键词")]])
+  }
+  if (!is.null(input[[paste0("filter_", "类别_无监督")]])) {
+    data <- data %>% filter(`类别_无监督` %in% input[[paste0("filter_", "类别_无监督")]])
+  }
+  if (!is.null(input[[paste0("filter_", "定量结果_离散")]])) {
+    data <- data %>% filter(`定量结果_离散` %in% input[[paste0("filter_", "定量结果_离散")]])
+  }  
+  if (!is.null(input[[paste0("filter_", "年龄_离散")]])) {
+    data <- data %>% filter(`年龄_离散` %in% input[[paste0("filter_", "年龄_离散")]])
+  }  
+  
+  return(data)
+}) %>% debounce(1000)
+
+quant_data <- reactive({
+  req(filtered_data())
+  req(input$CI_for_plot)
+  req(input$dynamic_header_)
+  
+  validate(need(nrow(filtered_data())>0, message = "请上传数据"))
+  if (!is.numeric(filtered_data()[["年龄"]])){
+    showNotification("年龄含有非数值水平", type = "warning")
+  }
+  if (!is.numeric(filtered_data()[["定量结果"]])){
+    showNotification("定量结果含有非数值水平", type = "warning")
+  }
+  validate(need(is.numeric(filtered_data()[["年龄"]]), message = "年龄含有非数值水平"))
+  validate(need(is.numeric(filtered_data()[["定量结果"]]), message = "定量结果含有非数值水平"))
+  
+  data_ <- filtered_data()
+  data_ <- data_[which(!is.na(data_$定量结果)),]
+  
+  # 处理离群值
+  upper_quatile <- data_$定量结果 %>% quantile(0.75)
+  IQR_ <- IQR(data_$定量结果)
+  outlier_bar <- IQR_*400 + upper_quatile # 标准高一点，400倍四分卫距
+  data_$定量结果[which(data_$定量结果%>% unlist() > outlier_bar)] <- outlier_bar
+  
+  # 计算box-cox最佳λ - 完全避免环境问题
+  # 直接使用数值向量而不是数据框
+  y_values <- as.numeric(data_$定量结果) + 0.1
+  
+  # 手动实现Box-Cox优化
+  lambda_seq <- seq(-2, 2, by = 0.05)
+  log_likelihoods <- sapply(lambda_seq, function(lambda) {
+    if (lambda == 0) {
+      y_trans <- log(y_values)
+    } else {
+      y_trans <- (y_values^lambda - 1) / lambda
+    }
+    
+    # 计算对数似然
+    n <- length(y_trans)
+    var_y <- var(y_trans)
+    if (is.na(var_y)) return(-Inf)
+    if (var_y == 0) return(-Inf)  # 避免零方差
+    
+    -n/2 * log(var_y) + (lambda - 1) * sum(log(y_values))
+  })
+  
+  # 找到最佳lambda
+  best_idx <- which.max(log_likelihoods)
+  best_lambda <- lambda_seq[best_idx]
+  
+  # 利用最优λ进行正态转换
+  data_$boxcox_result <- if (best_lambda == 0) {
+    log(data_$定量结果 + 0.1)
+  } else {
+    ((data_$定量结果 + 0.1)^best_lambda - 1) / best_lambda
+  }
+  
+  CI <- input$CI_for_plot
+
+  condition <- input$dynamic_header_
+  
+  extreme_quantiles <- c(CI[[1]], CI[[length(CI)]])
+  
+  count <- 0
+  CI_data <- list()
+  for (i in unique(data_[[condition]])){
+    count <- count + 1
+    result_ <- get_CI(data_ %>% filter(.data[[condition]]==i), CI = CI, win_width = input$win_width,input$min_num)
+    if (nrow(result_)==0){
+      next
+    }
+    CI_data[[count]] <- result_
+    CI_data[[count]]$condition <- i
+  }
+  CI_data <- do.call(rbind, CI_data)
+
+  list(data_, CI_data, extreme_quantiles, best_lambda)
+})
+
+output$gender_ratio <- renderValueBox({
+  req(filtered_data())
+  validate(need(nrow(filtered_data())>0, message = "请上传数据"))
+  
+  ratio <- filtered_data() %>%
+    count(性别) %>%
+    mutate(prop = n/sum(n)) %>%
+    filter(性别 == "男") %>%
+    pull(prop)
+  
+  valueBox(
+    paste0(round(ratio*100, 1), "%"),
+    "男性占比",
+    icon = icon("venus-mars"),
+    color = ifelse(ratio > 0.5, "maroon", "navy")
+  )
+})
+
+plot_data <- reactive({
+  req(filtered_data())
+  validate(need(nrow(filtered_data())>0, message = "请上传数据"))
+
+  validate(need(is.numeric(filtered_data()[["年龄"]]), message = "年龄含有非数值水平"))
+  
+  req(input$header_for_stack)
+  req(input$hash_color)
+  
+  current_data <- filtered_data()
+  selected_header <- input$header_for_stack
+  current_data$年龄组 <- discretize_age(current_data$年龄, grain = as.numeric(input$age_grain))
+  
+  plot_data <- current_data %>%
+    group_by(.data$年龄组, .data[[selected_header]]) %>%
+    reframe(n = n()) %>%
+    tidyr::complete(
+      年龄组 = levels(current_data$年龄组),
+      fill = list(n = 0)
+      )
+  sum_data <- plot_data %>% group_by(年龄组) %>% reframe(sum_n = sum(n))
+  plot_data <- merge(plot_data, sum_data, by = "年龄组")
+  plot_data$当前年龄占比 <- plot_data$n/plot_data$sum_n
+  
+  order_data <- plot_data %>% group_by(.data[[selected_header]]) %>% reframe(sum_ = sum(n)) %>% arrange(order_para()*sum_)
+  plot_data[[selected_header]] <- factor(plot_data[[selected_header]],levels = unlist(order_data[[selected_header]]))
+  
+  color <- lapply(unlist(order_data[[selected_header]]),string_to_color)
+  plot_data$年龄组 <- factor(plot_data$年龄组, levels = unlist(levels(current_data$年龄组)))
+  list(plot_data, color)
+})
+
+plot_data_time <- reactive({
+  req(filtered_data())
+  validate(need(nrow(filtered_data())>0, message = "请上传数据"))
+  validate(need(is.POSIXct(filtered_data()[["采样时间"]]), message = "采样时间含有非日期水平"))
+  
+  req(input$header_for_stack)
+  req(input$hash_color)
+  
+  current_data <- filtered_data()
+  selected_header <- input$header_for_stack
+  current_data$时间组 <- discretize_time(current_data$采样时间, grain = input$time_grain)
+  
+  plot_data <- current_data %>%
+    group_by(.data$时间组, .data[[selected_header]]) %>%
+    reframe(n = n()) %>%
+    tidyr::complete(
+      时间组 = levels(current_data$时间组),
+      fill = list(n = 0)
+      )
+  sum_data <- plot_data %>% group_by(时间组) %>% reframe(sum_n = sum(n))
+  plot_data <- merge(plot_data, sum_data, by = "时间组")
+  plot_data$当前时间组占比 <- plot_data$n/plot_data$sum_n
+  
+  order_data <- plot_data %>% group_by(.data[[selected_header]]) %>% reframe(sum_ = sum(n)) %>% arrange(order_para()*sum_)
+  plot_data[[selected_header]] <- factor(plot_data[[selected_header]],levels = unlist(order_data[[selected_header]]))
+  ## ##
+  color <- lapply(unlist(order_data[[selected_header]]),string_to_color)
+  plot_data$时间组 <- factor(plot_data$时间组, levels = unlist(levels(current_data$时间组)))
+  list(plot_data, color)
+})
+
+
+# 可视化逻辑
+output$age_mount_plot <- renderPlotly({
+  req(plot_data())
+  req(input$header_for_stack)
+  local_plot_data <- plot_data()[[1]]
+  
+  color_length <- plot_data()[[2]] %>% length()
+  color_times <- (color_length/length(colors4)) %>% ceiling
+  if (input$hash_color == "默认颜色"){
+    color_ <- rep(colors4, color_times)
+  }else{
+    color_ <- plot_data()[[2]]
+  }
+  
+  selected_header <- input$header_for_stack
+
+  p <- ggplot(local_plot_data, aes(x = 年龄组, y=n,fill = !!sym(selected_header))) + 
+        geom_col( position = "stack") + # "stack"，堆叠直方图
+        scale_fill_manual(values = color_) + #指定颜色向量
+        labs(title =paste0("患者","数量堆叠图（年龄）"), x = "年龄", y = "统计数量", fill="") + # 图标题
+        theme_minimal() +theme(
+          axis.text.x = element_text(angle = -60,hjust=0)  # X 轴刻度大小根据年龄分组长度自动调节，并旋转17度，hjust为x轴的对齐方式
+        )
+  
+  p <- ggplotly(p)
+  
+  plots_waiting_to_download[["患者数量堆叠图（年龄）"]] <- p
+  
+  p
+})
+
+output$time_mount_plot <- renderPlotly({
+  req(plot_data_time())
+  req(input$header_for_stack)
+  local_plot_data <- plot_data_time()[[1]]
+  
+  color_length <- plot_data_time()[[2]] %>% length()
+  color_times <- (color_length/length(colors4)) %>% ceiling
+  if (input$hash_color == "默认颜色"){
+    color_ <- rep(colors4, color_times)
+  }else{
+    color_ <- plot_data_time()[[2]]
+  }
+  
+  selected_header <- input$header_for_stack
+
+  p <- ggplot(local_plot_data, aes(x = 时间组, y=n,fill = !!sym(selected_header))) + 
+        geom_col( position = "stack") + # "stack"，堆叠直方图
+        scale_fill_manual(values = color_) + # 指定颜色向量
+        labs(title =paste0("患者","数量堆叠图（时间）"), x = "时间", y = "统计数量", fill="") +# 图标题
+        theme_minimal() +theme(
+          axis.text.x = element_text(angle = -60,hjust=0)  # X 轴刻度大小根据年龄分组长度自动调节，并旋转17度，hjust为x轴的对齐方式
+        )
+  
+  p <- ggplotly(p)
+  
+  plots_waiting_to_download[["患者数量堆叠图（时间）"]] <- p
+  
+  p
+})
+
+output$age_ratio_plot <- renderPlotly({
+  req(plot_data())
+  req(input$header_for_stack)
+  local_plot_data <- plot_data()[[1]]
+  
+  color_length <- plot_data()[[2]] %>% length()
+  color_times <- (color_length/length(colors4)) %>% ceiling
+  if (input$hash_color == "默认颜色"){
+    color_ <- rep(colors4, color_times)
+  }else{
+    color_ <- plot_data()[[2]]
+  }
+  
+  selected_header <- input$header_for_stack
+  
+  p <- ggplot(
+    local_plot_data, aes(x = 年龄组, y=当前年龄占比, fill = !!sym(selected_header))) + 
+    geom_col( position = "stack") + # "stack"，堆叠直方图
+    scale_fill_manual(values = color_) + #指定颜色向量
+    labs(title =paste0("患者","数量占比堆叠图（年龄）"), x = "年龄", y = "占比", fill="") + # 图标题
+    theme_minimal() +theme(
+      axis.text.x = element_text(angle = -60,hjust=0)  # X 轴刻度大小根据年龄分组长度自动调节，并旋转17度，hjust为x轴的对齐方式
+    )
+  
+  p <- ggplotly(p)
+  
+  plots_waiting_to_download[["患者数量占比堆叠图（年龄）"]] <- p
+  
+  p
+})
+
+output$pie_plot <- renderPlotly({
+  req(filtered_data())
+  req(order_para())
+  req(input$header_for_stack)
+  req(input$hash_color)
+  
+  validate(need(nrow(filtered_data())>0, message = "请上传数据"))
+  pie_data <- filtered_data() %>% as.data.frame
+  selected_header <- input$header_for_stack
+  
+  pie_data <- pie_data %>%
+  count(!!sym(selected_header)) %>%
+  rename(char = 1, freq = n) %>%
+  as.data.frame()  
+  
+  pie_data <- pie_data[order(order_para()*pie_data$freq),]
+  color_current <- lapply(pie_data$char, string_to_color)
+  color_length <- color_current %>% length()
+  color_times <- (color_length/length(colors4)) %>% ceiling
+  if (input$hash_color == "默认颜色"){
+    color_ <- rep(colors4, color_times)
+  }else{
+    color_ <- color_current
+  }
+  
+  pie_data$char <- paste0(pie_data$char, " 例数:", pie_data$freq, " 占比:", ((pie_data$freq/sum(pie_data$freq)) %>% scales::percent(accuracy = 0.1)))
+  pie_data$char <- factor(pie_data$char, levels = pie_data$char)
+  
+
+  
+  # 直接使用 plot_ly 创建饼图
+  p <- plot_ly(pie_data, 
+          labels = ~char, 
+          values = ~freq, 
+          type = "pie",
+          textinfo = "none", # 关闭饼图本体文字
+          hoverinfo = "label
+", # 悬停时显示信息
+          marker = list(colors = color_),
+          sort = FALSE) %>%
+    layout(
+      margin = list(
+        t = 30  # 增加顶部边距给主标题更多空间
+      ),
+      title = paste0("各", selected_header,"数量/占比"),
+      showlegend = TRUE
+    )
+  
+  plots_waiting_to_download[["饼图"]] <- p
+  
+  p
+})
+
+
+output$pie_plot2_with_console <- renderUI({
+  req(filtered_data)
+  req(input$header_for_stack)
+  
+  div(
+    style = "display: flex; flex-direction: column; height: 100%;",  # 关键：添加flex布局
+    fluidRow(
+      column(4, selectInput("second_dynamic_Var", "二级分层变量", choices = colnames(filtered_data()))),
+      column(4, selectInput("sec_Var_mode", "二级变量堆叠方式", choices = c("数量","比例"))),
+      column(4, sliderInput("elements_num", "上色前n个二级分层变量", min = 0, max = 100, value = 20))
+    ),
+    fluidRow(
+      style = "flex: 1; min-height: 0;",  # 关键：允许图表扩展
+      column(12, 
+             style = "height: 100%;",  # 确保列也有高度
+             plotlyOutput("dynamic_Var_plot", height = "100%")
+      )
+    )    
+  )
+})
+
+
+output$dynamic_Var_plot <- renderPlotly({
+  req(filtered_data())
+  validate(need(nrow(filtered_data()) > 0, message = "没有可用数据"))
+  req(input$header_for_stack)
+  req(input$second_dynamic_Var)
+  validate(need(input$header_for_stack != input$second_dynamic_Var, message = "一级/二级变量不能相同"))
+  
+  # 获取数据
+  data <- filtered_data()
+  
+  # 步骤1: 在每个主类别内部识别前20个最频繁的副类别
+  processed_data <- data %>%
+    # 计算每个主类别-副类别组合的数量
+    group_by(!!sym(input$header_for_stack), !!sym(input$second_dynamic_Var)) %>%
+    summarise(数量 = n(), .groups = "drop") %>%
+    
+    # 在每个主类别内部排序并标记前20
+    group_by(!!sym(input$header_for_stack)) %>%
+    arrange(desc(数量), .by_group = TRUE) %>%
+    mutate(
+      rank = row_number(),
+      second_dynamic_cat = if_else(
+        rank <= input$elements_num,
+        as.character(!!sym(input$second_dynamic_Var)),
+        "其他"
+      )
+    ) %>%
+    ungroup() %>%
+    
+    # 重新分组计算总数和比例
+    group_by(!!sym(input$header_for_stack), second_dynamic_cat) %>%
+    summarise(数量 = sum(数量), .groups = "drop") %>%
+    
+    # 计算每个主类别的总数
+    group_by(!!sym(input$header_for_stack)) %>%
+    mutate(总数 = sum(数量)) %>%
+    ungroup() %>%
+    mutate(比例 = 数量 / 总数) %>%
+    
+    # 按总数和数量降序排列
+    arrange(desc(总数), desc(order_para()*数量)) ### 加在这里
+  
+  # 步骤2: 确保"其他"在颜色顺序中排在最后
+  processed_data <- processed_data %>% 
+    mutate(
+      second_dynamic_cat = factor(
+        second_dynamic_cat,
+        levels = c(setdiff(unique(second_dynamic_cat), "其他"), "其他")
+      )
+    )
+  
+  # 在创建plotly图表前添加颜色映射
+  # 获取所有非"其他"的类别
+  non_other_cats <- setdiff(unique(processed_data$second_dynamic_cat), "其他")
+  
+  if (input$hash_color == "哈希颜色"){
+    color_palette = lapply(non_other_cats ,string_to_color) %>% unlist
+      # 创建完整的颜色映射，"其他"固定为灰色
+    color_mapping <- setNames(
+      c(color_palette, "grey"),  # 灰色为"其他"类别
+      c(non_other_cats, "其他")
+    )
+  }else {
+    # 默认颜色模式
+    color_mapping <- NULL  # 让plotly使用默认颜色
+  }
+  # 步骤3: 确保主类别保持排序顺序（按总数降序）
+  # 先创建一个主类别排序的向量
+  main_cat_order <- processed_data %>%
+    distinct(!!sym(input$header_for_stack), 总数) %>%
+    arrange(desc(总数)) %>%
+    pull(!!sym(input$header_for_stack))
+  
+  # 然后设置主类别的因子水平
+  processed_data <- processed_data %>%
+    mutate(
+      !!input$header_for_stack := factor(
+        !!sym(input$header_for_stack),
+        levels = main_cat_order
+      )
+    )
+  
+  # 创建堆叠条形图
+  plot <- plot_ly(
+    data = processed_data,
+    x = ~get(input$header_for_stack),
+    y = ~get(input$sec_Var_mode),
+    color = ~second_dynamic_cat,
+    colors = color_mapping,
+    type = "bar",
+    hovertext = ~paste0(
+      "一级分层变量: ", get(input$header_for_stack), "<br>",
+      "二级分层变量: ", second_dynamic_cat, "<br>",
+      "数量: ", 数量, " (", scales::percent(比例, accuracy = 0.1), ")"
+    ),
+    hoverinfo = "text",
+    showlegend = FALSE  # 不显示图例
+  ) %>%
+    layout(
+      barmode = "stack",
+      xaxis = list(
+        title = input$header_for_stack,
+        categoryorder = "array",
+        categoryarray = main_cat_order
+      ),
+      yaxis = list(
+        title = input$sec_Var_mode,
+        tickformat = ifelse(input$sec_Var_mode == "比例", ".0%", "")
+      ),
+      legend = list(
+        title = list(text = input$second_dynamic_Var)
+      )
+    )
+  
+  plots_waiting_to_download[["一级 vs 二级分层变量柱状图"]] <- plot
+  
+  return(plot)
+}) %>% debounce(1000)
+
+
+
+output$time_ratio_polt <- renderPlotly({
+  req(plot_data_time())
+  req(input$header_for_stack)
+  local_plot_data <- plot_data_time()[[1]]
+  
+  color_length <- plot_data_time()[[2]] %>% length()
+  color_times <- (color_length/length(colors4)) %>% ceiling
+  if (input$hash_color == "默认颜色"){
+    color_ <- rep(colors4, color_times)
+  }else{
+    color_ <- plot_data_time()[[2]]
+  }
+  
+  selected_header <- input$header_for_stack
+  
+  p <- ggplot(local_plot_data, aes(x = 时间组, y=当前时间组占比, fill = !!sym(selected_header))) + 
+        geom_col( position = "stack") + # "stack"，堆叠直方图
+        scale_fill_manual(values = color_) + #指定颜色向量
+        labs(title =paste0("患者数量占比堆叠图（时间）"), x = "时间", y = "占比", fill="") +# 图标题
+        theme_minimal() +theme(
+          axis.text.x = element_text(angle = -60,hjust=0)  # X 轴刻度大小根据年龄分组长度自动调节，并旋转17度，hjust为x轴的对齐方式
+        )
+  
+  p <- ggplotly(p)
+  
+  plots_waiting_to_download[["患者数量占比堆叠图（时间）"]] <- p
+  
+  p
+})  
+  
+output$quantiles_plot <- renderPlotly({
+  req(quant_data())
+  p <- plot_quantile_lines(quant_data()[[2]], quant_data()[[1]], quant_data()[[4]], input$dynamic_header_, quant_data()[[3]])
+  plots_waiting_to_download[[paste0(input$dynamic_header_,"分层分位数趋势/散点图")]] <- p
+  p
+})  
+
+
+output$raw_data_table <- DT::renderDataTable({
+  req(filtered_data())
+  validate(need(nrow(filtered_data()) > 0, "暂无可用数据"))
+  
+  # 获取数据
+  data <- filtered_data()
+  
+  # 确定要默认隐藏的列索引
+  # 例如：默认隐藏第3列和第5列（索引从0开始）
+  # 或者通过列名隐藏
+  hidden_columns <- which(names(data) %in% c("样本类型", "方法学", "项目序号", "结果单位","参考区间","备注信息","调研人")) - 1
+  
+  DT::datatable(
+    data,
+    extensions = c('Buttons'),
+    options = list(
+      pageLength = 100,
+      dom = 'Blfrtip',
+      buttons = list(
+        list(extend = 'excel', text = 'Excel导出'),
+        list(
+          extend = 'collection',
+          text = '列可见性',
+          buttons = list(
+            list(
+              extend = 'colvis',
+              text = '显示/隐藏列',
+              # 设置默认隐藏的列
+              columns = hidden_columns,
+              # 其他可选参数
+              collectionLayout = 'fixed three-column', # 布局
+              showAll = TRUE, # 显示"全部显示"按钮
+              restore = TRUE # 显示"恢复默认"按钮
+            )
+          )
+        )
+      ),
+      # 默认隐藏指定列
+      columnDefs = list(
+        list(targets = hidden_columns, visible = FALSE)
+      ),
+      paging = TRUE,
+      searching = TRUE,
+      ordering = TRUE,
+      info = TRUE,
+      autoWidth = TRUE,
+      language = list(
+        url = '//cdn.datatables.net/plug-ins/1.13.6/i18n/zh.json'
+      )
+    ),
+    class = "display compact hover",
+    rownames = FALSE,
+    filter = 'top',
+    selection = 'none'
+  ) %>%
+    DT::formatStyle(
+      columns = names(data),
+      fontSize = '14px',
+      lineHeight = '20px'
+    )
+})
+
+
+
+# 创建响应式更新逻辑
+observe({
+  req(reactive_data_na_())  # 验证数据
+  req(input$selected_grouping_col) 
+  validate(need(nrow(reactive_data_na_())>0, message = ""))
+  
+  data <- reactive_data_na_()
+  if (!"类别_关键词" %in% colnames(data)) {
+    data$`类别_关键词` <- ""
+  }
+  
+  new_table <- data %>% 
+    group_by(!!sym(input$selected_grouping_col), `类别_关键词`) %>%
+    reframe(数量 = n()) %>%
+    arrange(-数量)
+  
+  # 更新 reactiveVal
+  grouping_table(new_table)
+})
+
+output$diag_count<- DT::renderDataTable({
+  DT::datatable(
+    grouping_table(),
+    extensions = c('Buttons'),  # 移除了Scroller扩展
+    options = list(
+      pageLength = 40,  # 每页显示20行
+      dom = 'Blfrtip',  # 调整布局控件
+      paging = TRUE,  # 启用分页
+      searching = TRUE,  # 启用搜索框
+      ordering = TRUE,  # 启用排序
+      info = TRUE,  # 显示分页信息
+      autoWidth = TRUE,  # 自动调整列宽
+      language = list(
+        url = '//cdn.datatables.net/plug-ins/1.13.6/i18n/zh.json'  # 中文语言包
+      ),
+      # 分页控件样式
+      paginate = list(
+        first = '首页',
+        previous = '上一页',
+        `next` = '下一页',
+        last = '末页'
+      )
+    ),
+    rownames = FALSE,  # 不显示行号
+    filter = 'top'
+  )
+})
+
+output$choose_grouping_col <- renderUI({
+  selectInput(
+    "selected_grouping_col", 
+    "关键词聚类列",
+    choices = colnames(reactive_data_na_())[colnames(reactive_data_na_()) != "类别_关键词"],
+    selected = "临床诊断",
+    width = "100%"
+  )
+})
+
+output$choose_grouping_col2 <- renderUI({
+  selectInput(
+    "selected_grouping_col2", 
+    "无监督聚类列",
+    choices = colnames(reactive_data_na_())[colnames(reactive_data_na_()) != "类别_无监督"],
+    selected = "临床诊断",
+    width = "100%"
+  )
+})
+
+output$word_grouping_ui <- renderUI({
+  wellPanel(
+    fluidRow(
+      # 必填字段
+      column(4, textInput(paste0("Class_name"), 
+                          label = tagList(icon("tag"), " 类别名称", span("*", style = "color: red;")),
+                          width = "100%", value = Saved_Class_name())),
+      column(4, textInput(paste0("And1"), 
+                          label = tagList(icon("filter"), " 且条件1", span("*", style = "color: red;")),
+                          placeholder = "用 | 分隔多个条件",
+                          width = "100%", value = Saved_And1())),
+      column(4, textInput(paste0("And2"), 
+                          label = tagList(icon("filter"), " 且条件2"),
+                          placeholder = "可选附加条件",
+                          width = "100%", value = Saved_And2()))
+    ),
+  
+  # 第二行条件
+    fluidRow(
+      column(4, textInput(paste0("And3"), 
+                          label = tagList(icon("filter"), " 且条件3"),
+                          placeholder = "可选附加条件",
+                          width = "100%", value = Saved_And3())),
+      column(4, textInput(paste0("Not"), 
+                          label = tagList(icon("ban"), " 非条件"),
+                          placeholder = "排除满足这些条件的记录",
+                          width = "100%", value = Saved_Not())),
+      column(4, textInput(paste0("Not_limit"), 
+                          label = tagList(" 限制条件"),
+                          placeholder = "对非条件的适用范围做出限定",
+                          width = "100%", value = Saved_Not_limit()))
+    ),
+    fluidRow(
+      column(
+        12, 
+        selectizeInput(
+          paste0("exclude_group"),
+          label = tagList(icon("link-slash"), " 互斥类别"),
+          choices = colnames(grouping_table())[-c(1:3)],
+          multiple = TRUE,
+          options = list(placeholder = '选择需要排除的类别',plugins = list('remove_button')),
+          selected = Saved_selected_exclude_group(),
+          width = "100%"
+        )
+      )
+    ),
+    fluidRow(
+      column(8, textOutput("words_sentance")) %>% tagAppendAttributes(style = "color: #4DAF4A; font-weight: 500;"),
+      column(2, actionButton("start_grouping","创建新类", width = "100%")),
+      column(2, actionButton("over_write_data","写入数据", width = "100%"))
+    )
+  )
+})
+
+output$words_sentance <- renderText({
+  and_lst <- lapply(list(input$And1, input$And2, input$And3), function(i){
+    strsplit(i, split = "[；;|]") %>% unlist
+  })
+  and_lst_nonzero <- which(lapply(and_lst, length) != 0)
+  and_lst <- and_lst[and_lst_nonzero]
+  
+  and_counter <- 0
+  note_sentance <-  ""
+  for (i in and_lst){
+    and_counter <- and_counter + 1
+    and_connect <- ifelse(and_counter==1, "：包含(\"", ", 且包含(\"")
+    note_sentance <- paste0(note_sentance, and_connect)
+    note_sentance <- paste0(note_sentance, paste(i, collapse = "\"或\""))
+    note_sentance <- paste0(note_sentance, "\")")
+  }
+  
+  if ("ALL" %in% unlist(and_lst)){
+    note_sentance <- "：全部数据"
+  }
+  
+  not_lst <- strsplit(input$Not, split = "[；;|]") %>% unlist
+  not_limit_lst <- strsplit(input$Not_limit, split = "[；;|]") %>% unlist
+  
+  if (length(not_lst)>0){
+    note_sentance <- paste(note_sentance, ", 不包含(\"")
+    note_sentance <- paste0(note_sentance, paste(not_lst, collapse = "\"或\""))
+    if (length(not_limit_lst)>0){
+      note_sentance <- paste0(note_sentance, "\", 除非包含\"", paste(not_limit_lst, collapse = "\"或\""))
+    }
+    note_sentance <- paste0(note_sentance, "\")")
+  }
+  
+  if (length(input$exclude_group)>0){
+    note_sentance <- paste(note_sentance, ", 与(\"")
+    note_sentance <- paste0(note_sentance, paste(input$exclude_group, collapse = "\", \""))
+    note_sentance <- paste0(note_sentance, "\")互斥")
+  }
+  
+  and_lst_ <- and_lst_(and_lst)
+  not_lst_ <- not_lst_(not_lst)
+  not_limit_lst_ <- not_limit_lst_(not_limit_lst)
+  
+  paste0(input$Class_name, note_sentance)
+})
+
+observeEvent(input$start_grouping,{
+  grouping_info_vec <- grouping_table()[[input$selected_grouping_col]] %>% unlist
+  grouping_num <- lapply(grouping_info_vec, grouping_muti_groups, list_condition=and_lst_(), not=not_lst_(), not_restric=not_limit_lst_()) %>% unlist %>% which
+  for (i in input$exclude_group){
+    excluded_num <- which(unlist(grouping_table()[[i]]) != "")
+    grouping_num <- grouping_num[!(grouping_num %in% excluded_num)]
+  }
+  new_grouping_table <- grouping_table()
+  new_grouping_table[[input$Class_name]] <- ""
+  new_grouping_table[grouping_num,][[input$Class_name]] <- input$Class_name
+
+  Saved_Class_name(input$Class_name)
+  Saved_And1(input$And1)
+  Saved_And2(input$And2)
+  Saved_And3(input$And3)
+  Saved_Not(input$Not)
+  Saved_Not_limit(input$Not_limit)
+  Saved_selected_exclude_group(input$exclude_group)
+  
+  grouping_table(new_grouping_table)
+})
+
+observeEvent(input$over_write_data,{
+  
+  merge_table2 <- grouping_table()[,c(which(!colnames(grouping_table()) %in% c(input$selected_grouping_col,"类别_关键词","数量")))] %>%
+    
+    apply(., 1, function(i){
+      unlist(i)[which(unlist(i) != "")] %>% paste(., collapse = "|")
+    }) %>%
+    cbind(., grouping_table()[[input$selected_grouping_col]])
+  
+  colnames(merge_table2) <- c("类别_关键词", input$selected_grouping_col)
+  new_reactive_data <- reactive_data_na_() %>% dplyr::select(-any_of("类别_关键词"))
+  saved_col_names <- colnames(new_reactive_data)
+  new_reactive_data <- merge(new_reactive_data, merge_table2, by = input$selected_grouping_col, all.x = TRUE)
+  new_reactive_data <- new_reactive_data[,c(saved_col_names, "类别_关键词")]
+  
+  if (length(which(new_reactive_data$`类别_关键词` == ""))>0){
+    # showNotification(message = "有些数据没有被分到任何类别", type = "warning")
+    new_reactive_data[which(new_reactive_data$`类别_关键词` == ""),]$`类别_关键词` <- "未知"
+  }
+  reactive_data_na_(new_reactive_data)
+})
+
+observeEvent(input$selected_grouping_col2, {
+  output$diag_kmeans_ui <- renderUI({
+    div(style = "margin-top: 31px;",actionButton("load_model_worker","载入词向量模型，并进行分词和词语向量化"))
+  })
+})
+
+
+observeEvent(input$load_model_worker, {
+  output$diag_kmeans_ui <- renderUI({
+     div(
+       fluidRow(
+          # 必填字段
+          column(2, numericInput("cluster_num", "输入K-Means的Cluster数量:", value=30, min=0, max=100, width = "100%")),
+          column(2, div(style = "margin-top: 31px;", actionButton("Start_kmeans", "开始进行kmeans聚类", width = "100%"))),
+          column(2, uiOutput("merge_result_ui2"))
+       )
+      )
+  })
+  
+  # load词向量模型
+  showNotification("正在载入词向量模型..." ,type="message")
+  embedding_matrix(list.files(pattern = "original_word_matrix.rds", full.names = TRUE) %>% readRDS)
+  
+  showNotification("正在进行分词worker初始化..." ,type="message")
+  # 初始化分词worker
+  wk_ <- jiebaR::worker(
+    type = "tag",
+    user = "custom_words.txt" # 直接加载内存中的词
+  )
+  withProgress(message = "正在进行分词中...", value = 0, {
+    total <- nrow(grouping_table2())
+    # 判断是否有必要进行分词，如有则进行分词
+    jieba_tagging_or_not <- function(word_, jieba, embedding_matrix){ 
+      incProgress(1/total, detail = paste(""))
+      
+      if (word_ %in% rownames(embedding_matrix)){ # 如果在矩阵中直接就包含该词，则不需要分词
+        return(c("1" = word_))
+      } else{
+        result <- tryCatch(
+      {
+    # 尝试执行分词操作
+        jiebaR::tagging(word_, jieba)
+      },
+      error = function(e) {
+    # 出错时返回空字符向量
+        character(0)
+      }
+)
+
+return(result)
+# 如果在矩阵中不包含该词，则进行分词，并对词性进行标注
+      }
+    }
+    # 进行分词和词性标注
+    grouping_table2() %>% 
+      mutate(id = c(1:nrow(.))) %>% 
+      mutate(words = map(!!sym(input$selected_grouping_col2), jieba_tagging_or_not, jieba = wk_, embedding_matrix = embedding_matrix())) %>% # 分辨是否需要进行分词，还是直接向量化？
+      mutate(word_tag = map(words,enframe,name = "tag",value = "word")) %>% # 将分词结果、词性包装成一个data.frame并保存在word_tag列中，后续用于计算
+      mutate(word_tag_show = map(words,named_lst_paste)) -> # 将分词结果、词性包装成一个character中，用于展示
+      data2_  # 将计算结果给到data2,data2是用于计算的数据框
+  })
+  merge(grouping_table2(), data2_[,c(input$selected_grouping_col2, "word_tag_show")], by = input$selected_grouping_col2) %>% grouping_table2(.) # 更新grouping_table2(.)展示表格
+  
+  withProgress(message = "正在进行向量化...", value = 0, {
+    total <- nrow(data2_)
+    get_vec_frame <- function(word_tag, embedding_matrix){
+      incProgress(1/total, detail = paste(""))
+      word_tag %>% filter(tag %in% c("1")) -> word_tag_filtered
+      vec_lst <- lapply(word_tag_filtered$word, get_vec_, embedding_matrix) 
+      vec_lst <- vec_lst[which(!is.na(vec_lst))]
+      return(Reduce("+", vec_lst)/length(vec_lst))
+    }
+    data2_$word_vec <- lapply(data2_$word_tag, get_vec_frame, embedding_matrix = embedding_matrix()) # 进行词汇向量化
+  })
+  
+  data2(data2_) # 将data2_全局化为data2()
+})
+
+observeEvent(input$Start_kmeans,{
+  k <- input$cluster_num # 分为k个簇
+  # 计算相关参数
+  data2 <- data2()
+  max_sample_size <- max(data2$数量)
+  n <- log(max_sample_size, base = max(nrow(data2)/(2*k), 3)) # 底数根据诊断数量和簇数量计算得到
+  data2$sample_size_stand <- data2$数量^(1/n) %>% ceiling
+  data2_expanded <- data2 %>% # 计算聚类时的样本量权重
+    uncount(weights = sample_size_stand, .remove = FALSE, .id = "copy_id")
+  matrix_data <- do.call(rbind, data2_expanded$word_vec)
+  
+  set.seed(123)  # 保证可重复性
+  kmeans_result <- kmeans_with_progress(matrix_data, centers = k, nstart = 20, iter.max = 30) # 进行kmeans
+  
+  showNotification("正在整理K-means计算结果..." ,type="message")
+  # 将kmeans结果整理到表格中
+  cluster <- kmeans_result$cluster %>% unname()
+  data2_expanded$cluster <- NA
+  data2_expanded[which(lengths(data2_expanded$word_vec)>0),]$cluster <- cluster
+  data2_expanded <- data2_expanded %>% dplyr::select(-copy_id, -word_vec) %>% distinct()
+  
+  cluster_centers <- kmeans_result$centers #获得kmeans各个中心的座标
+
+  withProgress(message = "正在寻找中心临近关键词...", value = 0, {
+    # 使用优化函数寻找最接近中心的关键词
+    # 优化版：使用矩阵运算加速
+    find_closest_words_fast <- function(centers, embedding_matrix, top_n = 3) {
+      
+      incProgress(0/4, detail = paste("归一化向量"))
+      # 归一化向量
+      norm_embed <- t(apply(embedding_matrix, 1, function(x) x/sqrt(sum(x^2))))
+      incProgress(1/4, detail = paste("归一化向量"))
+      norm_centers <- t(apply(centers, 1, function(x) x/sqrt(sum(x^2))))
+      # 归一化向量
+      incProgress(2/4, detail = paste("余弦相似度计算"))
+      # 计算余弦相似度矩阵
+      similarity_matrix <- norm_embed %*% t(norm_centers)
+      incProgress(3/4, detail = paste("寻找top_n词语"))
+      # 为每个聚类中心找到top_n词语
+      lapply(1:nrow(centers), function(i) { 
+        sorted_indices <- order(similarity_matrix[, i], decreasing = TRUE)
+        rownames(embedding_matrix)[sorted_indices[1:top_n]]
+      })
+    }
+    closest_words_fast <- find_closest_words_fast(cluster_centers, embedding_matrix())
+    incProgress(4/4, detail = paste("完成"))
+  })
+  # 将优化函数给出的关键词置入表格中
+  closest_words_lst <- lapply(closest_words_fast, paste, collapse = "、") %>% unlist # 用"、"链接各个关键词
+  center_words <- data.frame("聚类中心临近诊断" = closest_words_lst, cluster = c(1:length(closest_words_lst)))
+  data3 <- merge(data2_expanded,center_words,by = "cluster")
+  
+  # 计算各个cluster的三种排名
+  # 计算每个点到其簇中心的距离
+  distances <- sqrt(rowSums((matrix_data - kmeans_result$centers[kmeans_result$cluster, ])^2))
+  
+  # 计算每个簇的平均距离
+  avg_distance <- tapply(distances, kmeans_result$cluster, mean)
+  sample_size <- tapply(data2_expanded$数量, data2_expanded$cluster, sum)
+  diag_size <- tapply(data2_expanded$数量, data2_expanded$cluster, length)
+  
+  # 创建排序数据框
+  dispersion_df <- data.frame(
+    cluster = as.numeric(names(avg_distance)),
+    avg_distance = avg_distance,
+    diag_size = diag_size,
+    sample_size_ = sample_size
+  ) %>% 
+    arrange(avg_distance)  # 按平均距离排序
+  
+  # 添加排名
+  dispersion_df$distances_rank <- 1:nrow(dispersion_df)
+  max_idx <- which.max(dispersion_df$distances_rank) # 添加distances_rank的最大惩罚
+  dispersion_df$distances_rank[max_idx] <- dispersion_df$distances_rank[max_idx] * 1.5 # 添加distances_rank的最大惩罚
+  
+  dispersion_df <- dispersion_df %>% arrange(-diag_size)
+  dispersion_df$diag_size_rank <- 1:nrow(dispersion_df)
+  max_idx <- which.max(dispersion_df$diag_size_rank) # 添加diag_size_rank的最大惩罚
+  dispersion_df$diag_size_rank[max_idx] <- dispersion_df$diag_size_rank[max_idx] * 1.5 # 添加diag_size_rank的最大惩罚
+  
+  dispersion_df <- dispersion_df %>% arrange(-sample_size_)
+  dispersion_df$sample_size_rank <- 1:nrow(dispersion_df)
+  max_idx <- which.max(dispersion_df$sample_size_rank) # 添加sample_size_rank的最大惩罚
+  dispersion_df$sample_size_rank[max_idx] <- dispersion_df$sample_size_rank[max_idx] * 1.5 # 添加sample_size_rank的最大惩罚
+  
+  dispersion_df$rank_sum <- dispersion_df$distances_rank + dispersion_df$diag_size_rank + dispersion_df$sample_size_rank
+  dispersion_df <- dispersion_df %>% arrange(rank_sum)
+  dispersion_df$sum_rank <- 1:nrow(dispersion_df)
+  
+  data4 <- merge(data3,dispersion_df,by="cluster")
+  
+  # 对data4排序并输出结果
+  data4 <- data4[,c("sum_rank","聚类中心临近诊断","sample_size_",input$selected_grouping_col2,"数量","word_tag_show","distances_rank","diag_size_rank","sample_size_rank")]
+  colnames(data4) <- c("类综合排名","类别_无监督","类别数量",
+                       input$selected_grouping_col2,paste0(input$selected_grouping_col2,"数量"),"分词与词性","类紧密度排名",
+                       paste0(input$selected_grouping_col2,"丰富度排名"),"样本数量排名")
+  data4 %>% grouping_table2(.) 
+  showNotification("完成K-means聚类" ,type="message")
+  output$merge_result_ui2 <- renderUI(div(style = "margin-top: 31px;",actionButton("merge_result2","聚类结果写入数据", width = "100%")))
+})
+
+observeEvent(input$merge_result2, { # 将结果写入reactive_data()
+  new_reactive_data <- reactive_data_na_() %>% dplyr::select(-any_of("类别_无监督"))
+  saved_col_names <- colnames(new_reactive_data)
+  new_reactive_data <- merge(new_reactive_data, grouping_table2()[,c(input$selected_grouping_col2, "类别_无监督")], by = input$selected_grouping_col2, all.x = TRUE)
+  new_reactive_data <- new_reactive_data[,c(saved_col_names, "类别_无监督")]
+  if (length(which(is.na(new_reactive_data$`类别_无监督`)))>0){
+    # showNotification(message = "有些数据没有被分到任何类别", type = "warning")
+    new_reactive_data[which(is.na(new_reactive_data$`类别_无监督`)),]$`类别_无监督` <- "未知"
+  }
+  reactive_data_na_(new_reactive_data)
+})
+```
+
+```{r}
+observe({
+  req(reactive_data_na_())  # 验证数据
+  validate(need(input$selected_grouping_col2 != "", message = ""))  # 验证数据
+  data <- reactive_data_na_()
+  if (!"类别_无监督" %in% colnames(data)) {
+    data$`类别_无监督` <- ""
+  }
+  
+  new_table <- data %>% 
+    group_by(!!sym(input$selected_grouping_col2), `类别_无监督`) %>%
+    reframe(数量 = n()) %>%
+    arrange(-数量)
+  
+  new_table <- new_table[,c(input$selected_grouping_col2, "数量", "类别_无监督")]
+  # 更新 reactiveVal
+  
+  grouping_table2(new_table)
+})
+
+output$diag_count2<- DT::renderDataTable({
+  DT::datatable(
+    grouping_table2(),
+    extensions = c('Buttons'),  # 移除了Scroller扩展
+    options = list(
+      pageLength = 40,  # 每页显示20行
+      dom = 'Blfrtip',  # 调整布局控件
+      paging = TRUE,  # 启用分页
+      lengthChange = FALSE,  # 禁用每页行数选择
+      searching = TRUE,  # 启用搜索框
+      ordering = TRUE,  # 启用排序
+      info = TRUE,  # 显示分页信息
+      autoWidth = TRUE,  # 自动调整列宽
+      language = list(
+        url = '//cdn.datatables.net/plug-ins/1.13.6/i18n/zh.json'  # 中文语言包
+      ),
+      buttons = list(), 
+      # 分页控件样式
+      paginate = list(
+        first = '首页',
+        previous = '上一页',
+        `next` = '下一页',
+        last = '末页'
+      )
+    ),
+    rownames = FALSE,  # 不显示行号
+    filter = 'top'
+  )
+})
+
+
+output$qr_regression <- renderUI({
+  div(
+    fluidRow(
+      column(2, numericInput("quantile_for_regression", "选择分位数回归的分位数", min = 0, max = 1, value = 0.5, step = 0.01, width = "100%")),
+      column(2, selectInput("regression_header", "选择分位数回归的因变量", choices = colnames(filtered_data()), selected = "定量结果", width = "100%")),
+      column(4, textInput("covariables", "请输入协变量表达式(第一次回归)", value = "I(年龄^2)", placeholder = "例如：年龄*性别 + I(年龄^2) + 性别:类别_无监督", width = "100%")),
+      column(2, 
+        selectInput(
+          inputId = "independent_variable",
+          label = "请选择自变量(第二次回归)",
+          choices = c(colnames(filtered_data())),
+          selected = "性别",
+          width = "100%"
+        )
+      ),
+      column(2, div(style = "margin-top: 31px;",actionButton("start_qr", "计算QR-ANCOVA",width = "100%"))),
+    ),
+    fluidRow(
+      column(12, textOutput("qr_regression_result")) %>% tagAppendAttributes(style = "color: #4DAF4A; font-weight: 500;")
+    )
+  )
+})
+
+# 实时显示当前的回归公式
+output$qr_regression_result <- renderText({
+  req(filtered_data())
+  validate(need(nrow(filtered_data())>0, message = "请上传数据"))  # 验证数据
+  
+  # 获取协变量表达式
+  covariables <- input$covariables
+  
+  regression_formula1 <- safe_formula(covariables, input$regression_header)
+  regression_formula2 <- safe_formula(input$independent_variable, "residuals1") 
+  
+  # 如果选择了自变量，则添加到公式中
+  if (!is.null(regression_formula1)) {
+    regression_formula1_ <- regression_formula1 %>% deparse() %>% paste0(., " + ", "residuals1")
+    global_regression_formula1(regression_formula1)
+  }else{
+    regression_formula1_ <- "无"
+    global_regression_formula1(NULL)
+  }
+  
+  # 如果选择了自变量，则添加到公式中
+  if (!is.null(regression_formula2) & regression_formula1_!="无") {
+    regression_formula2_ <- regression_formula2 %>% deparse() %>% paste0(., " + ", "residuals2")
+    global_regression_formula2(regression_formula2)
+  }else{
+    regression_formula2_ <- "无"
+    global_regression_formula2(NULL)
+  }
+  
+  paste0("第一次回归公式：", regression_formula1_ , "；第二次回归公式：", regression_formula2_)
+})
+
+observeEvent(input$start_qr, {
+  req(filtered_data())
+  validate(need(nrow(filtered_data())>0, message = "请上传数据"))
+  
+  if (is.null(global_regression_formula1())){
+    showNotification("请输入合法的协变量(第一次回归)公式", type = "warning")
+  }
+  
+  validate(need(!is.null(global_regression_formula1()), message = ""))
+  
+  
+  if (is.null(global_regression_formula2())){
+    showNotification("请输入合法的第二次回归公式", type = "warning")
+  }
+  validate(need(!is.null(global_regression_formula2()), message = ""))
+
+  current_filtered_data <- filtered_data()
+  
+  if (!all(all.vars(global_regression_formula1()) %in% colnames(current_filtered_data))){
+    showNotification("协变量公式中有不存在的变量名，请检查变量名是否正确", type = "warning")
+  }
+  validate(need(all(all.vars(global_regression_formula1()) %in% colnames(current_filtered_data)), message = ""))
+  
+  current_filtered_data[[input$regression_header]] <- current_filtered_data[[input$regression_header]] %>% as.numeric() %>% suppressWarnings()
+  current_filtered_data <- current_filtered_data %>% filter(!is.na(input$regression_header))
+  
+  first_regression_model <- rq(global_regression_formula1(), tau = input$quantile_for_regression, data = current_filtered_data)
+  current_filtered_data$residuals1 <- current_filtered_data[[input$regression_header]] - predict(first_regression_model) + first_regression_model$coefficients[1]  # 添加截距以恢复原始尺度
+  
+  # 步骤3: 在残差上拟合Group模型
+  second_regression_model <- rq(global_regression_formula2(), tau = input$quantile_for_regression, data = current_filtered_data)
+  
+  # 总结first_regression_model和second_regression_model
+ # 将回归结果转换为可展示的表格
+  output$first_regression_table <- DT::renderDataTable({
+    req(first_regression_model)
+    
+    # 获取第一次回归的summary
+    sum1 <- summary(first_regression_model, se = "iid")
+    
+    # 提取系数表格
+    coef_table1 <- as.data.frame(sum1$coefficients)[-1,]  # 去掉截距项]
+    colnames(coef_table1) <- c("估计值", "标准误", "t值", "p值")
+    # coef_table1$p值 <- format.pval(coef_table1$p值, digits = 3)
+    
+    # 添加额外信息
+    coef_table1$变量 <- rownames(coef_table1)
+    rownames(coef_table1) <- NULL
+    
+    # 使用DT展示
+    DT::datatable(
+      coef_table1[, c("变量", "估计值", "标准误", "t值", "p值")],
+      rownames = FALSE,
+      options = list(
+        pageLength = 1000,  # 每页显示20行
+        paging = TRUE,  # 启用分页
+        pageLength = 10,
+        scrollX = TRUE,
+        dom = 't',
+        language = list(url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Chinese.json')
+      )
+    ) %>%
+      formatRound(columns = c("估计值", "标准误", "t值", "p值"), digits = 4) %>%
+      formatStyle(
+        "p值",
+        color = styleInterval(c(0.01, 0.05), c("red", "orange", "black")),
+        fontWeight = styleInterval(0.05, c("bold", "normal"))
+      )
+  })
+  
+  output$second_regression_table <- DT::renderDataTable({
+    req(second_regression_model)
+    
+    # 获取第二次回归的summary
+    sum2 <- summary(second_regression_model, se = "iid")
+    
+    # 提取系数表格
+    coef_table2 <- as.data.frame(sum2$coefficients)
+    
+    rownames(coef_table2) <- sub(paste0("^",input$independent_variable), "", rownames(coef_table2)) 
+    colnames(coef_table2) <- c("估计值", "标准误", "t值", "p值")
+    
+    # 计算各类别样本量
+    category_counts <- table(current_filtered_data[[input$independent_variable]])
+    # 将样本量合并到系数表格
+    coef_table2$`样本量` <- sapply(rownames(coef_table2), function(x) {
+      if(x %in% names(category_counts)) {
+        as.numeric(category_counts[x])
+      } else {
+        NA  # 对于截距等非类别项
+      }
+    })
+
+    # 调整列顺序（可选）
+    coef_table2 <- coef_table2[, c("估计值", "标准误", "t值", "p值", "样本量")]
+    
+    # 添加额外信息
+    coef_table2$变量 <- rownames(coef_table2)
+    rownames(coef_table2) <- NULL
+    
+    # 使用DT展示
+    DT::datatable(
+      coef_table2[, c("变量", "样本量", "估计值", "标准误", "t值", "p值")],
+      rownames = FALSE,
+      options = list(
+        pageLength = 1000,  # 每页显示20行
+        paging = TRUE,  # 启用分页
+        pageLength = 10,
+        scrollX = TRUE,
+        dom = 't',
+        language = list(url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Chinese.json')
+      )
+    ) %>%
+      formatRound(columns = c("估计值", "标准误", "t值", "p值"), digits = 4) %>%
+      formatStyle(
+        "p值",
+        color = styleInterval(c(0.01, 0.05), c("red", "orange", "black")),
+        fontWeight = styleInterval(0.05, c("bold", "normal"))
+      )
+  })
+  
+  if (current_filtered_data[[input$independent_variable]] %>% is.numeric() %>% all()){
+    showNotification("数值型自变量不能进行组间比较", type = "warning")
+  }
+  validate(need(!(current_filtered_data[[input$independent_variable]] %>% is.numeric() %>% all()), message = ""))
+  
+  group_emmeans <- emmeans(second_regression_model, as.formula(paste0(" ~ ", input$independent_variable)), se = "iid")
+  contrast_all <- contrast(group_emmeans, method = "pairwise", adjust = "tukey")
+  compare_results <- summary(contrast_all, infer = c(TRUE, TRUE))
+  
+  # 1. 获取各组调整后的均值并排序
+  group_means <- as.data.frame(group_emmeans) %>%
+    arrange(desc(emmean)) %>%
+    mutate(group_order = row_number())
+  
+  # 2. 创建有序组名向量（效应越强排越前）
+  ordered_groups <- group_means[[input$independent_variable]]
+  
+  # 3. 准备热图数据（只保留上三角部分）
+  heatmap_data <- as.data.frame(compare_results) %>%
+    mutate(
+      group1 = gsub(" - .*", "", contrast),
+      group2 = gsub(".* - ", "", contrast)
+    )
+  
+  reverse_num <- (heatmap_data$estimate<0)
+  heatmap_data[reverse_num,c("lower.CL", "upper.CL", "t.ratio", "estimate")] <- heatmap_data[reverse_num,c("upper.CL", "lower.CL", "t.ratio", "estimate")]*(-1)
+  heatmap_data[reverse_num,c("group1", "group2")] <- heatmap_data[reverse_num,c("group2", "group1")] 
+  
+  heatmap_data_reversed <- heatmap_data
+  
+  heatmap_data_reversed[,c("lower.CL", "upper.CL", "t.ratio", "estimate")] <- heatmap_data_reversed[,c("upper.CL", "lower.CL", "t.ratio", "estimate")]*(-1)
+  heatmap_data_reversed[,c("group1", "group2")] <- heatmap_data_reversed[,c("group2", "group1")] 
+  
+  heatmap_data <- rbind(heatmap_data, heatmap_data_reversed)
+  
+  heatmap_data <- heatmap_data %>%
+  # 添加组排序信息
+  left_join(group_means %>% select(!!sym(input$independent_variable), group_order), by = c("group1" = input$independent_variable)) %>%
+  rename(group1_order = group_order) %>%
+  left_join(group_means %>% select(!!sym(input$independent_variable), group_order), by = c("group2" = input$independent_variable)) %>%
+  # 重新命名列
+  rename(group2_order = group_order) %>%
+  # 创建对比标识（按排序后的顺序）
+  mutate(
+    contrast_label = paste0(group1, " vs ", group2),
+    # 添加显著性标记
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    # 创建悬停文本
+    hover_text = paste0(
+      "对比: ", group1, " vs ", group2, "<br>",
+      "估计值: ", round(estimate, 3), "<br>",
+      "95% CI: [", round(lower.CL, 3), ", ", round(upper.CL, 3), "]<br>",
+      "p值: ", format.pval(p.value, digits = 3, eps = 0.001),
+      significance
+    )
+  )
+  
+    # 计算组数
+  n_groups <- length(ordered_groups)
+  
+  # 创建网格线形状列表
+  grid_shapes <- list()
+  
+  # 添加水平网格线
+  for(i in 0:n_groups) {
+    grid_shapes[[length(grid_shapes) + 1]] <- list(
+      type = "line",
+      x0 = -0.5,
+      x1 = n_groups - 0.5,
+      y0 = i - 0.5,
+      y1 = i - 0.5,
+      line = list(color = "black", width = 1, dash = "dot"),
+      layer = "below"
+    )
+  }
+  
+  # 添加垂直网格线
+  for(i in 0:n_groups) {
+    grid_shapes[[length(grid_shapes) + 1]] <- list(
+      type = "line",
+      x0 = i - 0.5,
+      x1 = i - 0.5,
+      y0 = -0.5,
+      y1 = n_groups - 0.5,
+      line = list(color = "black", width = 1, dash = "dot"),
+      layer = "below"
+    )
+  }
+
+  # 4. 创建热图
+  p <- plot_ly() %>%
+    # 先添加网格线图层（在热图下方）
+  
+    # 添加热图单元格（保持不变）
+    add_trace(
+      data = heatmap_data,
+      x = ~group2,
+      y = ~group1,
+      z = ~estimate,
+      type = "heatmap",
+      colors = colorRamp(c("blue", "white", "red")),
+      zmid = 0,
+      text = ~hover_text,
+      hoverinfo = "text",
+      colorbar = list(
+        title = "组间差异",
+        tickvals = c(min(heatmap_data$estimate), 0, max(heatmap_data$estimate)),
+        ticktext = c("负差异", "无差异", "正差异"),
+        # 调整标题字体
+        titlefont = list(
+          size = 25,  # 标题字体大小
+          family = "Arial",  # 字体类型
+          color = "#333"  # 字体颜色
+        ),
+        # 调整刻度标签字体
+        tickfont = list(
+          size = 25,  # 刻度标签字体大小
+          family = "Arial",
+          color = "#555"
+        )
+      ),
+      opacity = 0.8
+    ) %>%
+    # 添加显著性标记（保持不变）
+    add_annotations(
+      data = heatmap_data,
+      x = ~group2,
+      y = ~group1,
+      text = ~significance,
+      font = list(color = "black", size = min(400/n_groups, 40)),
+      showarrow = FALSE
+    ) %>%
+    # 布局设置（添加网格线形状）
+    layout(
+      title = list(
+        text = paste("组间生物标志物差异热图 (τ =", input$quantile_for_regression, ")"),
+        font = list(size = 35),
+        y = 0.98,  # 垂直位置 (0-1, 1=顶部)
+        x = 0.1  # 水平位置 (0-1, 0.5=居中)
+      ),
+      margin = list(
+        t = 160,  # 上边距 (单位为像素)
+        b = 80,  # 下边距
+        l = 80,  # 左边距
+        r = 550   # 右边距
+      ),
+      xaxis = list(
+        title = "被比较组 (效应强度递减)",
+        type = "category",
+        categoryorder = "array",
+        categoryarray = rev(ordered_groups),
+        tickangle = -90,
+        showgrid = FALSE,  # 关闭默认网格线
+        gridcolor = "white",
+        # 调整标签大小
+        tickfont = list(
+          size = min(100/n_groups^(1/2), 18),  # 标签字体大小
+          family = "Arial"  # 字体类型
+        ),
+        
+        # 调整标题大小
+        titlefont = list(
+          size = 25,  # 标题字体大小
+          family = "Arial",
+          color = "#333"  # 标题颜色
+        )
+      ),
+      yaxis = list(
+        title = "参考组 (效应强度递减)",
+        type = "category",
+        categoryorder = "array",
+        categoryarray = ordered_groups,
+        showgrid = FALSE,  # 关闭默认网格线
+        gridcolor = "white",
+        # 调整标签大小
+        tickfont = list(
+          size = min(100/n_groups^(1/2), 18),  # 标签字体大小
+          family = "Arial"  # 字体类型
+        ),
+        
+        # 调整标题大小
+        titlefont = list(
+          size = 25,  # 标题字体大小
+          family = "Arial",
+          color = "#333"  # 标题颜色
+        )
+      ),
+      margin = list(l = 120, r = 50, b = 120, t = 100),
+      shapes = append(grid_shapes, list(  # 添加网格线和对角线
+        # 添加对角线指示器
+        list(
+          type = "line",
+          x0 = -0.5, 
+          x1 = n_groups - 0.5,
+          y0 = n_groups - 0.5,
+          y1 = -0.5,
+          line = list(color = "grey", width = 1, dash = "dot"),
+          layer = "below"
+        )
+      )),
+      annotations = list(
+        list(
+          x = 0.5,
+          y = 1.05,
+          xref = "paper",
+          yref = "paper",
+          text = paste("模型:", deparse(formula(second_regression_model)), 
+                      "| *p<0.05, **p<0.01, ***p<0.001"),
+          showarrow = FALSE,
+          font = list(size = 18)
+        )
+      )
+    ) 
+  
+  # 5. 添加组效应强度指示器
+  # 在左侧添加组效应强度条
+  for (i in seq_along(ordered_groups)) {
+    group <- ordered_groups[i]
+    mean_val <- group_means$emmean[group_means[[input$independent_variable]] == group]
+    
+    p <- p %>%
+      add_annotations(
+        x = -0.3,
+        y = group,
+        xref = "x",
+        yref = "y",
+        text = sprintf("%.2f", mean_val),
+        showarrow = FALSE,
+        font = list(size = min(350/n_groups, 20)),
+        xanchor = "right"
+      )
+  }
+  
+  # 6. 添加热图说明
+  p <- p %>%
+    add_annotations(
+      x = 0.5,
+      y = 1.08,
+      xref = "paper",
+      yref = "paper",
+      text = "热图单元格 = 参考组 - 被比较组 (正值=红色表示参考组效应更强)",
+      showarrow = FALSE,
+      font = list(size = 18, color = "#7F8C8D")
+    )
+  
+  # 显示图形
+  output$comparison_plot <- renderPlotly({
+    p
+  })
+})
+
+
+output$kde_distribution_analysis_ui <- renderUI(
+  div(
+    fluidRow(
+      column(2, selectInput("kde_independent_variable", "自变量(色彩分层)", choices = colnames(filtered_data()), selected = "试剂厂家", width = "100%")),
+      column(4, selectInput(inputId = "kde_covariables_stra",label = "分层控制协变量",choices = c(colnames(filtered_data())), selected = "性别", multiple = TRUE, width = "100%")),
+      column(2, selectInput("qr_step", "尾部分位数精确程度", choices = c(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2), selected = 0.01, width = "100%")),
+      column(4, div(style = "margin-top: 31px;",actionButton("cal_stratification", "计算/更新分层变量",width = "100%")))
+      
+    )
+  )
+)
+
+
+observeEvent(input$cal_stratification, {
+  req(filtered_data())
+  req(input$kde_independent_variable, input$kde_covariables_stra)
+  if (!is.numeric(filtered_data()[["年龄"]])){
+    showNotification("年龄含有非数值水平", type = "warning")
+  }
+  if (!is.numeric(filtered_data()[["定量结果"]])){
+    showNotification("定量结果含有非数值水平", type = "warning")
+  }
+  validate(need(is.numeric(filtered_data()[["年龄"]]), message = "年龄含有非数值水平"))
+  validate(need(is.numeric(filtered_data()[["定量结果"]]), message = "定量结果含有非数值水平"))
+  
+  df <- filtered_data()
+  df$定量结果 <- df$定量结果 %>% log_trans(base = 10)
+  covar_vars <- input$kde_covariables_stra
+  indep_var <- input$kde_independent_variable
+  
+  # 验证变量存在
+  all_vars <- c(covar_vars, indep_var)
+  if (!all(all_vars %in% names(df))) {
+    showNotification("某些变量不存在于数据集中", type = "error")
+    return(NULL)
+  }
+  
+  # 第一步：按协变量分组并创建第一层列表
+  result_list <- df %>%
+    group_by(across(all_of(covar_vars))) %>%
+    group_split(.keep = TRUE) %>%
+    map(function(group_df) {
+      # 获取当前分组的键值
+      group_keys <- group_df %>% 
+        select(all_of(covar_vars)) %>% 
+        distinct() %>% 
+        as.list()
+      
+      # 创建命名字符串
+      name_str <- paste(
+        map2_chr(names(group_keys), group_keys, ~ paste(.x, .y, sep = "=")),
+        collapse = "|"
+      )
+      
+      # 返回包含数据和键值的列表
+      list(
+        data = group_df,
+        keys = group_keys,
+        name = name_str
+      )
+    }) %>%
+    # 使用name_str作为顶层列表的名称
+    set_names(map_chr(., ~ .x$name))
+  
+  
+  
+  # 第二步：为每个第一层组创建第二层（按独立变量分组）
+  nested_data <- map(result_list, function(sub_df) {
+    # 获取当前协变量组合的值（用于后续命名）
+    covar_vals <- sub_df[["data"]] %>% 
+      select(all_of(covar_vars)) %>% 
+      distinct() %>% 
+      as.list()
+    
+    # 按独立变量分组
+    second_layer <- sub_df[["data"]] %>%
+      group_by(across(all_of(indep_var))) %>%
+      group_split(.keep = TRUE) %>%
+      set_names(map_chr(., function(subgroup_df) {
+        subgroup_df[[indep_var]][1]  # 取第一个值作为名称
+      }))
+    
+    # 添加协变量组合信息到每个子表（可选）
+    second_layer <- map(second_layer, function(tbl) {
+      df <- tbl %>% mutate(across(
+        all_of(covar_vars),
+        ~ factor(., levels = unique(.))
+      ))
+      list(df,sub_df[["keys"]])
+    })
+    
+    return(second_layer)
+  })
+  
+  
+  result <- lapply(c(1:length(nested_data)), function(i){
+    sec_layer_df <- vapply(seq_along(nested_data[[i]]), 
+                           function(j) {
+                             c(names(nested_data[[i]])[j], 
+                               nrow(nested_data[[i]][[j]][[1]]))
+                           },
+                           FUN.VALUE = character(2)) %>%  # 指定输出为2元素字符向量
+      t() %>%  # 转置为n行2列
+      as.data.frame(stringsAsFactors = FALSE)
+  
+    sec_layer_df$first_layer_names <- names(nested_data)[[i]]
+    
+    sec_layer_df
+  }) %>% do.call(rbind, .)
+  
+  
+  colnames(result) <- c("自变量", "数量", "分层协变量")
+  result <- result[,c("自变量", "分层协变量", "数量")]
+  result$数量 <- result$数量 %>% as.numeric()
+  
+  min_sample_size <- 10/as.numeric(input$qr_step) # 最低样本量要求
+  rec_sample_size <- 30/as.numeric(input$qr_step) # 推荐样本量要求
+  
+  p <- result %>%
+    plot_ly(
+      x = ~分层协变量, 
+      y = ~数量, 
+      color = ~自变量, 
+      type = "bar",
+      colors = "Set2",
+      hovertemplate = paste(
+        "<b>分层协变量</b>: %{x}<br>",
+        "<b>自变量</b>: %{text}<br>",
+        "<b>数量</b>: %{y}",
+        "<extra></extra>"
+      ),
+      text = ~自变量
+    ) %>%
+    # 添加最低样本量参考线（红色虚线）
+    add_lines(
+      x = ~分层协变量,
+      y = min_sample_size,
+      line = list(color = "red", dash = "dash", width = 1),
+      name = paste0("最低样本量 (", round(min_sample_size), ")"),
+      hoverinfo = "",
+      showlegend = FALSE
+    ) %>%
+    # 添加推荐样本量参考线（深绿色虚线）
+    add_lines(
+      x = ~分层协变量,
+      y = rec_sample_size,
+      line = list(color = "#006400", dash = "dash", width = 1),  # 深绿色
+      name = paste0("推荐样本量 (", round(rec_sample_size), ")"),
+      hoverinfo = "",
+      showlegend = FALSE
+    ) %>%
+    layout(
+      title = list(
+        text = "<b>各分层样本量确认</b>",
+        font = list(size = 20, family = "Arial")
+      ),
+      xaxis = list(
+        title = list(text = "<b>分层协变量</b>", 
+                     font = list(size = 20, family = "Arial")),
+        type = "category",
+        tickfont = list(size = 16)  # X轴刻度标签大小
+      ),
+      yaxis = list(
+        title = list(text = "<b>数量</b>", 
+                     font = list(size = 20, family = "Arial")),
+        tickfont = list(size = 17)  # Y轴刻度标签大小
+      ),
+      barmode = "group",
+      bargap = 0.15,
+      bargroupgap = 0.05,
+      uniformtext = list(
+        minsize = 10,  # 增大数据标签字体
+        mode = "hide"
+      ),
+      legend = list(
+        title = list(text = "<b>自变量</b>", 
+                     font = list(size = 20, family = "Arial")),
+        font = list(size = 14, family = "Arial"),  # 图例项字体大小
+        orientation = "v",
+        x = 1,  # 稍微右移
+        y = 0.5,
+        xanchor = "left",
+        bgcolor = "rgba(255,255,255,0.8)",  # 半透明背景
+        bordercolor = "#CCCCCC",
+        borderwidth = 1
+      ),
+      margin = list(t = 90, b = 80, l = 80, r = 150),  # 增加右边距给图例
+      font = list(family = "Arial"),  # 全局字体
+    annotations = list(
+      # 最低样本量标注
+      list(
+        x = 0.99, y = min_sample_size,
+        xref = "paper", yref = "y",
+        text = paste0("最低样本量: ", round(min_sample_size)),
+        showarrow = FALSE,
+        font = list(size = 14, color = "red"),
+        bgcolor = "rgba(255, 200, 200, 0.5)",
+        borderpad = 4
+      ),
+      # 推荐样本量标注
+      list(
+        x = 0.99, y = rec_sample_size,
+        xref = "paper", yref = "y",
+        text = paste0("推荐样本量: ", round(rec_sample_size)),
+        showarrow = FALSE,
+        font = list(size = 14, color = "#006400"),
+        bgcolor = "rgba(200, 255, 200, 0.5)",
+        borderpad = 4,
+        xanchor = "right")
+    ) )
+  
+  # 显示结果
+  output$sample_size_plot <- renderPlotly({p})
+  output$qr_distribution_estimation <- renderUI(
+    div(
+      fluidRow(
+        # 第一行控件保持不变
+        column(2, selectInput("stratification_to_cal", "选择进行分布估计的分层", choices = names(nested_data), width = "100%")),
+        column(2, selectInput("kde_dependent_variable", "因变量", choices = colnames(filtered_data()), selected = "定量结果", width = "100%")),
+        column(4, textInput("kde_covariables_qr", "请输入通过分位数回归校正的协变量", value = "I(年龄^2)", placeholder = "例如：年龄:性别 + I(年龄^2)", width = "100%")),
+        column(2, numericInput("min_sample_size", "分层最低样本量", value = 200, min = 0, max = 10000, width = "100%")),
+        column(2, div(style = "margin-top: 31px;", actionButton("show_parameters_of_layers", "计算各分层默认参数", width = "100%")))
+      ),
+      
+      # 优化后的内容区域
+      div(
+        style = "display: flex; flex-direction: column; height: calc(100vh - 200px); min-height: 1200px;", 
+        
+        # 第一行：两个较小的控件
+        div(
+          style = "display: flex; gap: 10px; margin-bottom: 10px;",
+          div(style = "flex: 1;", uiOutput("distribution_compare_controller")),
+          div(style = "flex: 1;", uiOutput("baseline_controller_ui"))
+        ),
+        
+        # 第二行：主要的内容区域
+        div(
+          style = "display: flex; gap: 10px; flex-grow: 1; min-height: 500px;",
+          
+          # 左侧面板
+          div(
+            style = "flex: 1; height: 100%; min-width: 400px;",
+            uiOutput("tabsets_ui", style = "height: 100%; overflow: auto; background: white; border: 1px solid #ddd; border-radius: 4px; padding: 10px;")
+          ),
+          
+          # 右侧面板
+          div(
+            style = "flex: 1; height: 100%; min-width: 200px;",
+            uiOutput("ranking_ui", style = "height: 100%; overflow: auto; background: white; border: 1px solid #ddd; border-radius: 4px; padding: 10px;")
+          )
+        ),
+        uiOutput("method_quantile_selection_UI"),
+        
+        div(
+          style = "display: flex; gap: 10px; flex-grow: 1; min-height: 500px;",
+          
+          # 左侧面板
+          div(
+            style = "flex: 1; height: 100%; min-width: 400px;",
+            uiOutput("RI_result_table_ui", style = "height: 100%; overflow: auto; background: white; border: 1px solid #ddd; border-radius: 4px; padding: 10px;")
+          )
+        )
+        
+      )
+    )
+  )
+
+  
+  global_nested_data(nested_data)
+})
+
+observeEvent(input$show_parameters_of_layers, {
+  # 数据前处理，保证最低样本量符合要求，并计算有效协变量水平
+  ## 筛选样本量大于最低要求的分层
+  filtered_nested_data <- lapply(global_nested_data(),function(i){
+    inde_element_filtered <- lapply(i, function(j){
+      if (nrow(j[[1]]) < input$min_sample_size){
+        NA
+      }else{j}
+    })
+    inde_element_filtered[!is.na(inde_element_filtered)]
+  })
+  
+  # 部分分层协变量分层没有有效的颜色协变量分层，去除所有此类协变量分层
+  element_status <-  lapply(filtered_nested_data, function(i){
+    length(i) != 0
+  }) %>% unlist %>% unname()
+  filtered_nested_data <- filtered_nested_data[element_status]
+  
+  
+  rq_formula <- safe_formula(input$kde_covariables_qr, input$kde_dependent_variable)
+  all_var_in_formula <- all.vars(rq_formula)
+  all_var_to_test <- all_var_in_formula[which(all_var_in_formula != input$kde_dependent_variable)]
+  
+  # 生成有效协变量，有效回归公式
+  nested_data_ready <- lapply(names(filtered_nested_data), function(data_num_stratified, original_rq_formula = rq_formula){
+    lst_return <- lapply(names(filtered_nested_data[[data_num_stratified]]), function(data_num){
+      rq_formula_for_this_section <- original_rq_formula
+      
+      valid_var_lst <- return_validity_of_variables(filtered_nested_data[[data_num_stratified]][[data_num]][[1]], all_var_to_test)
+      non_numeric_loc <- (!(lapply(valid_var_lst, is.numeric) %>% unlist %>% unname())) %>% which
+  
+      if (length(non_numeric_loc)>0){
+        names_var <- names(valid_var_lst)[[non_numeric_loc]]   
+        count <- 0
+        for (i in valid_var_lst[[non_numeric_loc]]){
+          count <- count + 1
+          if (length(i) == 0){
+            rq_formula_for_this_section <- NA
+            break
+          }else if (length(i) == 1){
+            rq_formula_for_this_section <- rq_formula_for_this_section %>% delete_var(.,names_var[[count]])
+          }
+        }
+      }
+  
+      return(
+        list(
+          "数据" = filtered_nested_data[[data_num_stratified]][[data_num]][[1]],
+          "有效协变量" = c(filtered_nested_data[[data_num_stratified]][[data_num]][[2]], valid_var_lst),
+          "回归公式" = rq_formula_for_this_section,
+          "分层名称" = data_num
+        )
+      )
+    
+    })
+    names(lst_return) <- names(filtered_nested_data[[data_num_stratified]])
+    lst_return
+  })
+
+  names(nested_data_ready) <- names(filtered_nested_data)
+  chosen_data <- nested_data_ready[[input$stratification_to_cal]]
+  
+  global_nested_data_ready(nested_data_ready)
+  global_data_to_cal(chosen_data)
+  output$distribution_compare_controller <- renderUI({
+    tagList(
+      fluidRow(
+        column(4, actionButton("start_rectified_distribution", "计算所有分层的校正后分布函数", class = "btn-primary")),
+        # column(4, uiOutput("dowload_data_uioutput")),
+        # column(4, downloadButton("download_all","下载全网格数据")),
+        column(4, actionButton("calculate_rank","计算Equivalent Height/FWHM排名"))
+      )
+    )
+  })
+})
+```
+
+```{r}
+# output$download_all <- downloadHandler(
+#   filename = function() {
+#     paste0("analysis_", format(Sys.time(), "%Y%m%d"), ".rds")
+#   },
+#   content = function(file) {
+#     # 获取当前数据
+#     data_to_save <- global_nested_data_ready()
+#     
+#     # 添加元数据
+#     attr(data_to_save, "metadata") <- list(
+#       created = Sys.time(),
+#       user = ifelse(exists("USER"), USER, "unknown"),
+#       app_version = "1.2.0"
+#     )
+#     
+#     # 保存为RDS
+#     saveRDS(data_to_save, file)
+#   }
+# )
+
+observeEvent(input$calculate_rank,{
+  data2_ <- lapply(global_nested_data_ready(), function(i){
+    lapply(i, generate_quantiles_and_rq_models)
+  })
+  
+  covariates_lst <- list()
+  for (i in data2_){
+    for (j in i){
+      for (x in names(j[["有效协变量"]])){
+        covariates_lst[[x]] <- c(covariates_lst[[x]], j[["有效协变量"]][[x]])
+      }
+    }
+  }
+  
+  for (i in seq_along(covariates_lst)){
+    if (all(is.numeric(covariates_lst[[i]] %>% unlist))){
+      covariates_lst[[i]] <- range(covariates_lst[[i]] %>% unlist) %>% sort
+      covariates_lst[[i]] <- seq(covariates_lst[[i]][[1]], covariates_lst[[i]][[2]], by = 4)
+    }else{
+      covariates_lst[[i]] <- unique(covariates_lst[[i]] %>% unlist)
+    }
+  }
+  
+  covariates_grid <- expand.grid(covariates_lst, stringsAsFactors = FALSE)
+  
+  data_lst <- list()
+  for (i in data2_){
+    data_lst <- c(data_lst, i %>% unname())
+  }
+  
+  FWHM_lst <- list()
+  for (i in 1:nrow(covariates_grid)){
+    showNotification(paste("正在评估各协变量水平下的分布特征：", i, "/", nrow(covariates_grid)))
+    baseline <- covariates_grid[i,]
+    active_data <- filter_active_stratifications_data(baseline, data_lst)
+    active_data2 <- lapply(active_data, spline_regression_and_smooth_derivative, baseline = baseline) %>% suppressWarnings()
+    FWHM_result <- lapply(active_data2, calculate_FWHM)
+    names(FWHM_result) <- lapply(active_data, function(j){
+      j[["分层名称"]]
+    }) %>% unlist
+    
+    baseline_chr <- lapply(1:ncol(baseline), function(i){
+      paste0(names(baseline)[[i]], " = ", baseline[1, i])
+    }) %>% unlist %>% paste(collapse = "|")
+    FWHM_lst[[baseline_chr]] <- list("result" = FWHM_result, "baseline" = baseline)
+  }
+  
+  score_lst <- list()
+  for (j in names(FWHM_lst)){
+    group_names <- FWHM_lst[[j]][["result"]] %>% names()
+    score_lst_ <- lapply(FWHM_lst[[j]][["result"]], function(i){
+      i[["equivalent_height_FWHM_ratio"]]
+    }) %>% unlist
+    names(score_lst_) <- group_names
+    score_lst_ <- score_lst_ %>% sort(decreasing = TRUE)
+    score_lst[[j]] <- score_lst_
+  }
+  
+  pudding_matrix <- all_pairs(do.call(c, data2_ %>% unname()) %>% names %>% unique())
+  pudding_matrix[, c(3, 4, 5, 6)] <- 0
+  colnames(pudding_matrix) <- c("i", "j", "r_ij", "w_ij", "w_ji", "t_ij")
+  
+  
+  for (i in names(score_lst)){
+    # 定义名称
+    names_lst <- score_lst[[i]] %>% names
+    # 定义指针
+    x <- 0
+    # 如果有效组数量太少，则不计算
+    if (length(score_lst[[i]]) < 2){
+      next
+    }
+    
+    while (x < length(score_lst[[i]]) - 1){
+      x <- x + 1
+      y <- x + 1
+      while (y <= length(score_lst[[i]]) - 1){
+        x_names <- names_lst[[x]]
+        y_names <- names_lst[[y]]
+        
+        location_wij <- which(pudding_matrix[["i"]] == x_names & pudding_matrix[["j"]] == y_names)
+        location_wji <- which(pudding_matrix[["j"]] == x_names & pudding_matrix[["i"]] == y_names)
+        
+        if (length(location_wij) != 0){
+          pudding_matrix[location_wij,][["w_ij"]] <- pudding_matrix[location_wij,][["w_ij"]] + 1
+        }
+        if (length(location_wji) != 0){
+          pudding_matrix[location_wji,][["w_ji"]] <- pudding_matrix[location_wji,][["w_ji"]] + 1
+        }
+        
+        y <- y + 1
+      }
+    }
+  }
+  pudding_matrix$r_ij <- pudding_matrix$w_ij + pudding_matrix$w_ji
+  pudding_matrix <- pudding_matrix %>% filter(r_ij != 0)
+  
+  
+  i_wins <- data.frame(Winner = pudding_matrix$i, Loser = pudding_matrix$j)
+  j_wins <- data.frame(Winner = pudding_matrix$j, Loser = pudding_matrix$i)
+  
+  if (getRversion() < "3.6.0"){
+    n <- nrow(pudding_matrix)
+    ties <- data.frame(Winner = array(split(pudding_matrix[c("i", "j")], 1:n), n),
+                       Loser = rep(NA, nrow(pudding_matrix)))
+  } else {
+    ties <- data.frame(Winner = asplit(pudding_matrix[c("i", "j")], 1),
+                       Loser = rep(NA, nrow(pudding_matrix)))
+  }
+  
+  R <- as.rankings(rbind(i_wins, j_wins, ties), input = "orderings")
+
+  w <- unlist(pudding_matrix[c("w_ij", "w_ji", "t_ij")])
+  
+  valid_weights <- w > 0
+  R_filtered <- R[valid_weights, ]
+  w_filtered <- w[valid_weights]
+  
+  
+  mod <- PlackettLuce(
+    R_filtered,
+    weights = w_filtered,
+    npseudo = 0.5,
+    maxit = 1000
+  )
+  result <- coef(mod, log = FALSE)
+  
+  # 创建排序后的结果表格
+  result_table <- data.frame("result" = result, "names" = names(result)) %>% arrange(-result)
+  result_table$rank <- c(1:nrow(result_table))
+  
+  # 在 Shiny 的 server 部分添加以下代码
+  output$ranking_ui <- renderUI({
+    # 渲染数据表格
+    dataTableOutput("ranking_table")
+  })
+  
+  # 创建实际的数据表格输出
+  output$ranking_table <- renderDataTable({
+    
+    # 添加自定义格式
+    datatable(
+      result_table,
+      rownames = FALSE,
+      colnames = colnames(result_table),
+      options = list(
+        pageLength = 10,
+        autoWidth = TRUE,
+        dom = 'tlip',
+        columnDefs = list(
+          list(targets = 0, className = 'dt-center'),
+          list(targets = 1, className = 'dt-left')
+        )
+      )
+    )
+  })
+  
+  # 在服务器逻辑部分，找到 observeEvent(input$calculate_rank,{ 函数
+# 在 global_result_table(result_table) 这行代码之后修改：
+  
+  global_result_table(result_table)
+  
+  # 在 method_quantile_selection_UI 中修改手动模式的界面部分：
+
+  output$method_quantile_selection_UI <- renderUI({
+    div(
+      style = "height: 100%; overflow-y: auto;",
+      # 原有的间接法方法选择控件
+      fluidRow(
+        column(2, selectInput("RI_method", "请选择间接法方法", 
+                             choices = c("refineR", "Tukey"), 
+                             selected = "refineR", width = "100%")),
+        column(4, pickerInput(inputId = "RI_quantiles", 
+                             label = "选择计算的参考区间分位数", 
+                             choices = c(0.01, 0.025, 0.05, 0.1, 0.9, 0.95, 0.975, 0.99), 
+                             selected = c(0.025, 0.975), 
+                             multiple = TRUE, 
+                             options = list(`actions-box` = TRUE))),
+        column(2, textInput("exclude_ratio", "异常值排除比例", 
+                           value = "50%", 
+                           placeholder = "输入排除比例", width = "100%"))
+      ),
+    
+      # 新增：参考区间配置界面
+      div(
+        style = "margin-top: 20px; padding: 20px; background: white; border-radius: 8px; border: 1px solid #ddd; max-height: 90vh; overflow-y: auto;",
+        h4("参考区间配置", style = "color: #2c3e50; margin-bottom: 20px;"),
+      
+        # 模式选择
+        fluidRow(
+          column(12,
+                 radioButtons(
+                   inputId = "RI_mode",
+                   label = "年龄段选择模式",
+                   choices = c("自动" = "auto", "手动" = "manual"),
+                   selected = "auto",
+                   inline = TRUE
+                 )
+          )
+        ),
+      
+        # 手动模式配置界面
+        conditionalPanel(
+          condition = "input.RI_mode == 'manual'",
+          fluidRow(
+            column(12,
+                   div(
+                     class = "config-card",
+                     h4("第一步：设置年龄分段", style = "color: #2c3e50; margin-bottom: 15px;"),
+                     div(
+                       style = "margin-bottom: 15px;",
+                       pickerInput(
+                         inputId = "age_segments", 
+                         label = "选择年龄分界点（将年龄分成多个区间）",
+                         choices = seq(1, 119, by = 1),
+                         multiple = TRUE,
+                         options = list(
+                           `actions-box` = TRUE,
+                           `live-search` = TRUE,
+                           `selected-text-format` = "count > 2"
+                         )
+                       )
+                     ),
+                     uiOutput("age_segments_display")
+                   )
+            )
+          ),
+        
+          # 第二步：性别分层配置 - 使用可滚动容器
+          fluidRow(
+            column(12,
+                   div(
+                     class = "config-card",
+                     h4("第二步：为每个年龄段选择是否进行性别分层", style = "color: #2c3e50; margin-bottom: 15px;"),
+                     div(
+                       uiOutput("gender_stratification_ui")
+                     )
+                   )
+            )
+          )
+        ),
+      
+        # 计算按钮
+        fluidRow(
+          column(12,
+                 div(
+                   style = "text-align: center; margin-top: 15px;",
+                   actionButton("calculate_RI", "计算参考区间", 
+                                class = "btn-primary",
+                                style = "font-weight: bold; padding: 10px 20px;")
+                 )
+          )
+        ),
+      
+        # 结果显示区域
+        fluidRow(
+          column(12,
+                 div(
+                   style = "margin-top: 15px;",
+                   uiOutput("RI_results_display")
+                 )
+          )
+        )
+      )
+    )
+  })
+  
+  # 显示年龄分段
+  output$age_segments_display <- renderUI({
+    age_points <- input$age_segments
+    if (is.null(age_points) || length(age_points) == 0) {
+      return(p("当前年龄分段：0~120"))
+    }
+  
+    age_points <- sort(as.numeric(age_points))
+    age_ranges <- c()
+  
+    # 第一个区间
+    if (age_points[1] > 0) {
+      age_ranges <- c(age_ranges, paste0("0~", age_points[1]-1))
+    }
+  
+    # 中间区间
+    for (i in 1:(length(age_points)-1)) {
+      age_ranges <- c(age_ranges, paste0(age_points[i], "~", age_points[i+1]-1))
+    }
+  
+    # 最后一个区间
+    age_ranges <- c(age_ranges, paste0(age_points[length(age_points)], "~120"))
+  
+    div(
+      style = "margin-top: 10px; padding: 10px; background: white; border-radius: 3px;",
+      p(strong("当前年龄分段:"), paste(age_ranges, collapse = " | "))
+    )
+  })
+  
+  # 动态生成性别分层配置
+  # 在手动模式的UI部分添加合并年龄段选择功能
+  output$gender_stratification_ui <- renderUI({
+    age_points <- input$age_segments
+    if (is.null(age_points) || length(age_points) == 0) {
+      return(NULL)
+    }
+
+    age_points <- sort(as.numeric(age_points))
+    age_ranges <- c(0, age_points, 120)
+  
+    # 使用更紧凑的布局
+    tagList(
+      lapply(1:(length(age_ranges)-1), function(i) {
+        age_low <- age_ranges[i]
+        age_high <- age_ranges[i+1]
+    
+        # 生成区间标签
+        if (i == 1) {
+          age_range_label <- paste0("0~", age_high-1)
+        } else if (i == length(age_ranges)-1) {
+          age_range_label <- paste0(age_low, "~120")
+        } else {
+          age_range_label <- paste0(age_low, "~", age_high-1)
+        }
+    
+       div(
+          class = "age-segment-item",
+          h5(paste("年龄段:", age_range_label, "岁")),
+          checkboxInput(
+            inputId = paste0("stratify_", i),
+            label = "在此年龄段内按性别分层计算参考区间",
+            value = FALSE
+          ),
+        
+          # 如果选择分层，显示性别分界点配置
+          conditionalPanel(
+            condition = paste0("input.stratify_", i, " == true"),
+            div(
+             class = "gender-stratification-section",
+              fluidRow(
+                column(6,
+                       pickerInput(
+                         inputId = paste0("male_cut_", i),
+                         label = "男性参考区间年龄分界点",
+                         choices = seq(age_low, age_high-1, by = 1),
+                         multiple = TRUE,
+                         options = list(
+                           `actions-box` = TRUE,
+                           `live-search` = TRUE
+                         )
+                       )
+                ),
+                column(6,
+                       pickerInput(
+                         inputId = paste0("female_cut_", i),
+                         label = "女性参考区间年龄分界点",
+                         choices = seq(age_low, age_high-1, by = 1),
+                         multiple = TRUE,
+                         options = list(
+                           `actions-box` = TRUE,
+                           `live-search` = TRUE
+                         )
+                       )
+                )
+              )
+            )
+          ),
+        
+          # 添加合并年龄段选择（仅在不进行性别分层时显示）
+          conditionalPanel(
+            condition = paste0("input.stratify_", i, " == false"),
+            div(
+              class = "merge-age-section",
+              checkboxInput(
+                inputId = paste0("merge_", i),
+                label = "将此年龄段纳入合并计算",
+                value = FALSE
+              )
+            )
+          )
+        )
+      })
+    )
+  })
+
+  # 修改手动模式计算逻辑
+  observeEvent(input$calculate_RI, {
+    # 显示计算进度
+    showNotification("正在计算参考区间...", type = "message")
+    # 获取数据
+    data <- filtered_data()
+    exclude_ratio <- input$exclude_ratio
+    decimal_exclude_ratio <- (exclude_ratio %>% gsub("%","", .) %>% as.numeric)/100
+    data <- data %>% filter(`类别_无监督` %in% global_result_table()$names)
+    total_rnum <- nrow(data)
+    num_bar <- total_rnum*(1-decimal_exclude_ratio)
+  
+    # 排除异常值
+    for (i in global_result_table()$names){
+      if (num_bar >= nrow(data)){break}
+      data <- data %>% filter(`类别_无监督` != i)
+    }
+    
+    # 根据模式选择计算方式
+    if (input$RI_mode == "auto") {
+      # 自动模式 - 使用原有逻辑
+      indicator_name <- data$项目名称[[1]]
+      data_saved <- data
+      data <- data[,c("性别", "年龄", "定量结果")]
+      
+      all_possible_cut_points_lst <- list()
+      for (age_cutoff in as.character(c(0:2))){
+        all_possible_cut_points_lst[[age_cutoff]] <- series_of_segment(data, as.numeric(age_cutoff), 15)
+      }
+      
+      Sex_Age_stratification_SDR <- lapply(all_possible_cut_points_lst, return_SDR_lst, data = data, indicator_names = indicator_name)
+      
+      best_stratified_data_by_SDR <- list()
+      best_stratified_data_by_SDR <- return_best_SDR(Sex_Age_stratification_SDR)
+      best_stratified_data_by_SDR[["statified_data"]] <- statify_data(data_saved, best_stratified_data_by_SDR)
+      
+      result_df <- data.frame(matrix(nrow = 0, ncol = 7))
+      colnames(result_df) <- c("年龄段", "性别分层", "样本量", "参考值分位数", "点估计值", "95%CI下界", "95%CI上界")
+      RIperc <- input$RI_quantiles %>% unlist %>% as.numeric()
+      num_i <- 0
+      for (i in names(best_stratified_data_by_SDR[["statified_data"]])){
+        num_i <- num_i + 1
+        showNotification(paste0("正在运行refineR：",num_i, "/", length(names(best_stratified_data_by_SDR[["statified_data"]]))))
+         sex_group_names <- best_stratified_data_by_SDR[["statified_data"]][[i]] %>% names
+         for (j in sex_group_names){
+           processing_data <- best_stratified_data_by_SDR[["statified_data"]][[i]][[j]]
+           n <- nrow(processing_data)
+           if(input$RI_method == "refineR") {
+             RI <- findRI(Data = unlist(processing_data$定量结果), NBootstrap = 0) 
+             RI_matrix <- getRI(RI, RIperc = RIperc, pointEst="medianBS")
+           } else {
+             RI_matrix <- calculate_tukey_ri(sub_data$定量结果, RIperc) 
+           }
+           for (x in (1:nrow(RI_matrix))){
+             result_df[nrow(result_df) + 1,] <- c(i, j, n, RI_matrix[x,] %>% unlist %>% unname %>% as.numeric %>% round(3))
+           }
+         }
+      }
+      
+      # 显示自动模式结果
+      output$RI_results_display <- renderUI({
+        div(
+          h4("自动模式参考区间结果"),
+          downloadButton("download_RI_data", "下载数据"),
+          dataTableOutput("RI_result_table")
+        )
+      })
+      
+      output$RI_result_table <- renderDataTable({
+      datatable(
+        result_df,
+        rownames = FALSE,
+        colnames = c("年龄段", "性别分层", "样本量", "参考值分位数", "点估计值", "95%CI下界", "95%CI上界"),
+        options = list(
+          pageLength = 100,
+          autoWidth = FALSE,
+          scrollX = TRUE,
+          scrollY = "600px",
+          scrollCollapse = TRUE,
+          dom = 'Blfrtip',
+          columnDefs = list(
+            list(targets = 0, className = 'dt-center', width = '15%'),
+            list(targets = 1, className = 'dt-center', width = '12%'),
+            list(targets = 2, className = 'dt-center', width = '8%'),
+            list(targets = 3, className = 'dt-center', width = '12%'),
+            list(targets = 4, className = 'dt-center', width = '15%'),
+            list(targets = 5, className = 'dt-center', width = '15%'),
+           list(targets = 6, className = 'dt-center', width = '15%')
+          )
+        )
+      )
+    })
+  
+    # 数据下载
+    output$download_RI_data <- downloadHandler(
+      filename = function() {
+        paste0("auto_RI_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv")
+      },
+      content = function(file) {
+        write.csv(result_df, file, row.names = FALSE)
+      }
+    )
+  } else {
+    req(input$age_segments)
+    # 获取年龄分段
+    age_points <- sort(as.numeric(input$age_segments))
+    age_ranges <- c(0, age_points, 120)
+  
+    # 创建结果数据框
+    result_df <- data.frame(matrix(nrow = 0, ncol = 7))
+    colnames(result_df) <- c("年龄段", "性别分层", "样本量", "参考值分位数", "点估计值", "95%CI下界", "95%CI上界")
+  
+    # 根据选择的间接法方法计算参考区间
+    RIperc <- input$RI_quantiles %>% unlist %>% as.numeric()
+  
+    # 找出标记为合并的年龄段索引
+    merged_indices <- c()
+    for (i in 1:(length(age_ranges)-1)) {
+      merge_input <- input[[paste0("merge_", i)]]
+      if (!is.null(merge_input) && merge_input) {
+        merged_indices <- c(merged_indices, i)
+      }
+    }
+  
+    # 计算每个年龄段的参考区间
+    for (i in 1:(length(age_ranges)-1)) {
+      age_low <- age_ranges[i]
+      age_high <- age_ranges[i+1]
+    
+      # 生成外层区间标签（用于显示）
+      if (i == 1) {
+        outer_age_label <- paste0("0~", age_high-1)
+      } else if (i == length(age_ranges)-1) {
+        outer_age_label <- paste0(age_low, "~120")
+      } else {
+        outer_age_label <- paste0(age_low, "~", age_high-1)
+      }
+    
+      # 获取该年龄段数据
+      age_data <- data %>% 
+        filter(年龄 >= age_low, 年龄 < age_high)
+    
+      # 检查是否在此年龄段进行性别分层
+      stratify_input <- input[[paste0("stratify_", i)]]
+    
+      if (!is.null(stratify_input) && stratify_input) {
+        # 进行性别分层计算
+        male_cut_points <- input[[paste0("male_cut_", i)]]
+        female_cut_points <- input[[paste0("female_cut_", i)]]
+      
+        # 计算男性参考区间
+        if (!is.null(male_cut_points) && length(male_cut_points) > 0) {
+          male_cut_points_sorted <- sort(as.numeric(male_cut_points))
+          male_sub_ranges <- c(age_low, male_cut_points_sorted, age_high)
+        
+          for (j in 1:(length(male_sub_ranges)-1)) {
+            sub_low <- male_sub_ranges[j]
+            sub_high <- male_sub_ranges[j+1]
+          
+            # 生成细分区间标签
+            if (j == 1) {
+              sub_age_label <- paste0(sub_low, "~", sub_high-1)
+            } else if (j == length(male_sub_ranges)-1) {
+              sub_age_label <- paste0(sub_low, "~", age_high-1)
+            } else {
+              sub_age_label <- paste0(sub_low, "~", sub_high-1)
+            }
+          
+            # 获取该子区间男性数据
+            sub_data <- age_data %>% 
+              filter(性别 == "男", 年龄 >= sub_low, 年龄 < sub_high)
+          
+            if (nrow(sub_data) >= 20) {
+              # 根据选择的方法计算参考区间
+              if (input$RI_method == "refineR") {
+                RI <- findRI(Data = unlist(sub_data$定量结果), NBootstrap = 0)
+                RI_matrix <- getRI(RI, RIperc = RIperc, pointEst = "medianBS")
+              } else if (input$RI_method == "Tukey") {
+                # Tukey方法计算参考区间
+                RI_matrix <- calculate_tukey_ri(sub_data$定量结果, RIperc)
+              }
+            
+              for (x in 1:nrow(RI_matrix)) {
+                result_df[nrow(result_df) + 1,] <- c(
+                  sub_age_label,  # 使用细分区间标签
+                  "Male",
+                  nrow(sub_data),
+                  RI_matrix[x,1] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                  RI_matrix[x,2] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                  RI_matrix[x,3] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                  RI_matrix[x,4] %>% unlist %>% unname %>% as.numeric %>% round(3)
+                )
+              }
+            }
+          }
+        } else {
+          # 没有设置男性分界点，计算整个年龄段的男性参考区间
+          male_data <- age_data %>% filter(性别 == "男")
+          if (nrow(male_data) >= 20) {
+            # 根据选择的方法计算参考区间
+            if (input$RI_method == "refineR") {
+              RI <- findRI(Data = unlist(male_data$定量结果), NBootstrap = 0)
+              RI_matrix <- getRI(RI, RIperc = RIperc, pointEst = "medianBS")
+            } else if (input$RI_method == "Tukey") {
+              # Tukey方法计算参考区间
+              RI_matrix <- calculate_tukey_ri(male_data$定量结果, RIperc)
+            }
+          
+            for (x in 1:nrow(RI_matrix)) {
+              result_df[nrow(result_df) + 1,] <- c(
+                outer_age_label,  # 使用外层区间标签
+                "Male",
+                nrow(male_data),
+                RI_matrix[x,1] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                RI_matrix[x,2] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                RI_matrix[x,3] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                RI_matrix[x,4] %>% unlist %>% unname %>% as.numeric %>% round(3)
+              )
+            }
+          }
+        }
+      
+        # 计算女性参考区间
+        if (!is.null(female_cut_points) && length(female_cut_points) > 0) {
+          female_cut_points_sorted <- sort(as.numeric(female_cut_points))
+          female_sub_ranges <- c(age_low, female_cut_points_sorted, age_high)
+        
+          for (j in 1:(length(female_sub_ranges)-1)) {
+            sub_low <- female_sub_ranges[j]
+            sub_high <- female_sub_ranges[j+1]
+          
+            # 生成细分区间标签
+            if (j == 1) {
+              sub_age_label <- paste0(sub_low, "~", sub_high-1)
+            } else if (j == length(female_sub_ranges)-1) {
+              sub_age_label <- paste0(sub_low, "~", age_high-1)
+            } else {
+              sub_age_label <- paste0(sub_low, "~", sub_high-1)
+            }
+          
+            # 获取该子区间女性数据
+            sub_data <- age_data %>% 
+              filter(性别 == "女", 年龄 >= sub_low, 年龄 < sub_high)
+          
+            if (nrow(sub_data) >= 20) {
+              # 根据选择的方法计算参考区间
+              if (input$RI_method == "refineR") {
+                RI <- findRI(Data = unlist(sub_data$定量结果), NBootstrap = 0)
+                RI_matrix <- getRI(RI, RIperc = RIperc, pointEst = "medianBS")
+              } else if (input$RI_method == "Tukey") {
+                # Tukey方法计算参考区间
+                RI_matrix <- calculate_tukey_ri(sub_data$定量结果, RIperc)
+              }
+            
+              for (x in 1:nrow(RI_matrix)) {
+                result_df[nrow(result_df) + 1,] <- c(
+                  sub_age_label,  # 使用细分区间标签
+                  "Female",
+                  nrow(sub_data),
+                  RI_matrix[x,1] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                  RI_matrix[x,2] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                  RI_matrix[x,3] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                  RI_matrix[x,4] %>% unlist %>% unname %>% as.numeric %>% round(3)
+                )
+              }
+            }
+          }
+        } else {
+          # 没有设置女性分界点，计算整个年龄段的女性参考区间
+          female_data <- age_data %>% filter(性别 == "女")
+          if (nrow(female_data) >= 20) {
+            # 根据选择的方法计算参考区间
+            if (input$RI_method == "refineR") {
+              RI <- findRI(Data = unlist(female_data$定量结果), NBootstrap = 0)
+              RI_matrix <- getRI(RI, RIperc = RIperc, pointEst = "medianBS")
+            } else if (input$RI_method == "Tukey") {
+              # Tukey方法计算参考区间
+              RI_matrix <- calculate_tukey_ri(female_data$定量结果, RIperc)
+            }
+          
+            for (x in 1:nrow(RI_matrix)) {
+              result_df[nrow(result_df) + 1,] <- c(
+                outer_age_label,  # 使用外层区间标签
+                "Female",
+                nrow(female_data),
+                RI_matrix[x,1] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                RI_matrix[x,2] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                RI_matrix[x,3] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                RI_matrix[x,4] %>% unlist %>% unname %>% as.numeric %>% round(3)
+              )
+            }
+          }
+        }
+      } else {
+        # 不进行性别分层，检查是否标记为合并
+        if (i %in% merged_indices) {
+          # 标记为合并的年龄段不单独计算，将在后面合并计算
+          # 这里不做任何处理
+        } else {
+          # 不进行性别分层且未标记合并，计算混合参考区间
+          if (nrow(age_data) >= 20) {
+            # 根据选择的方法计算参考区间
+            if (input$RI_method == "refineR") {
+              RI <- findRI(Data = unlist(age_data$定量结果), NBootstrap = 0)
+              RI_matrix <- getRI(RI, RIperc = RIperc, pointEst = "medianBS")
+            } else if (input$RI_method == "Tukey") {
+              # Tukey方法计算参考区间
+              RI_matrix <- calculate_tukey_ri(age_data$定量结果, RIperc)
+            }
+          
+            for (x in 1:nrow(RI_matrix)) {
+              result_df[nrow(result_df) + 1,] <- c(
+                outer_age_label,  # 使用外层区间标签
+                "Male&Female",
+                nrow(age_data),
+                RI_matrix[x,1] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                RI_matrix[x,2] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                RI_matrix[x,3] %>% unlist %>% unname %>% as.numeric %>% round(3),
+                RI_matrix[x,4] %>% unlist %>% unname %>% as.numeric %>% round(3)
+              )
+            }
+          }
+        }
+      }
+    }
+  
+    # 计算合并的年龄段（如果有的话）
+    if (length(merged_indices) > 0) {
+      # 合并数据
+      merged_data <- data.frame()
+      merged_segments <- c()
+    
+      for (i in merged_indices) {
+        age_low <- age_ranges[i]
+        age_high <- age_ranges[i+1]
+      
+        # 生成区间标签
+        if (i == 1) {
+          segment_label <- paste0("0~", age_high-1)
+        } else if (i == length(age_ranges)-1) {
+          segment_label <- paste0(age_low, "~120")
+        } else {
+          segment_label <- paste0(age_low, "~", age_high-1)
+        }
+      
+        # 获取该年龄段数据
+        segment_data <- data %>% 
+          filter(年龄 >= age_low, 年龄 < age_high)
+      
+        merged_data <- rbind(merged_data, segment_data)
+        merged_segments <- c(merged_segments, segment_label)
+      }
+    
+      if (nrow(merged_data) >= 20) {
+        # 根据选择的方法计算参考区间
+        if (input$RI_method == "refineR") {
+          RI <- findRI(Data = unlist(merged_data$定量结果), NBootstrap = 0)
+          RI_matrix <- getRI(RI, RIperc = RIperc, pointEst = "medianBS")
+        } else if (input$RI_method == "Tukey") {
+          # Tukey方法计算参考区间
+          RI_matrix <- calculate_tukey_ri(merged_data$定量结果, RIperc)
+        }
+      
+        # 创建合并标签
+        merged_label <- paste(merged_segments, collapse = " & ")
+      
+        for (x in 1:nrow(RI_matrix)) {
+          result_df[nrow(result_df) + 1,] <- c(
+            merged_label,  # 使用合并区间标签
+            "Male&Female",
+            nrow(merged_data),
+            RI_matrix[x,1] %>% unlist %>% unname %>% as.numeric %>% round(3),
+            RI_matrix[x,2] %>% unlist %>% unname %>% as.numeric %>% round(3),
+            RI_matrix[x,3] %>% unlist %>% unname %>% as.numeric %>% round(3),
+            RI_matrix[x,4] %>% unlist %>% unname %>% as.numeric %>% round(3)
+          )
+        }
+      }
+    }
+  
+    # 显示手动模式结果
+    output$RI_results_display <- renderUI({
+      div(
+        h4("手动模式参考区间结果"),
+        downloadButton("download_RI_data", "下载数据"),
+        div(
+          style = "height: 1000px; overflow: auto; border: 1px solid #ddd;",
+          dataTableOutput("RI_result_table")
+        )
+      )
+    })
+  
+    output$RI_result_table <- renderDataTable({
+      datatable(
+        result_df,
+        rownames = FALSE,
+        colnames = c("年龄段", "性别分层", "样本量", "参考值分位数", "点估计值", "95%CI下界", "95%CI上界"),
+        options = list(
+          pageLength = 100,
+          autoWidth = FALSE,
+          scrollX = TRUE,
+          scrollY = "600px",
+          scrollCollapse = TRUE,
+          dom = 'Blfrtip',
+          columnDefs = list(
+            list(targets = 0, className = 'dt-center', width = '15%'),
+            list(targets = 1, className = 'dt-center', width = '12%'),
+            list(targets = 2, className = 'dt-center', width = '8%'),
+            list(targets = 3, className = 'dt-center', width = '12%'),
+            list(targets = 4, className = 'dt-center', width = '15%'),
+            list(targets = 5, className = 'dt-center', width = '15%'),
+           list(targets = 6, className = 'dt-center', width = '15%')
+          )
+        )
+      )
+    })
+  
+    # 数据下载
+    output$download_RI_data <- downloadHandler(
+      filename = function() {
+        paste0("manual_RI_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv")
+      },
+      content = function(file) {
+        write.csv(result_df, file, row.names = FALSE)
+      }
+    )
+  }
+  })
+})
+```
+
+```{r}
+generate_quantiles <- function(i, input, oringin_data) {
+  
+    # 获取参数
+    rq_acc <- 0.001
+    rq_num <- max(min(ceiling(nrow(oringin_data)/5), 200), 25)
+
+    # 定义非线性变换函数 (Beta分布)
+    # 使序列在两端更密集 (shape < 1)
+    nonlinear_seq <- function(n, lower, upper, shape = 0.1) {
+      u <- seq(0, 1, length.out = n)
+      # Beta累积分布函数的反函数 (两端密集)
+      q <- qbeta(u, shape, shape)
+      # 缩放至目标区间
+      lower + q * (upper - lower)
+    }
+    
+    # 生成序列1：基于定量结果的极端值 (非线性变换)
+    n_points <- ceiling(rq_num*1)
+    target_range <- c(
+      quantile(oringin_data[["数据"]]$定量结果, rq_acc),
+      quantile(oringin_data[["数据"]]$定量结果, 1 - rq_acc)
+    )
+    
+    # 在定量结果范围内生成非线性序列
+    dense_x <- nonlinear_seq(n_points, target_range[1], target_range[2])
+    seq1 <- unlist(lapply(dense_x, get_quantile_position, data = oringin_data[[1]]$定量结果))
+    
+    # 生成序列2：极端分位数位置 (非线性变换)
+    seq2 <- nonlinear_seq(n_points, rq_acc, 1 - rq_acc)
+    
+    # 合并并去重
+    combined <- c(seq1, seq2) %>% unique() %>% sort()
+    # showNotification(paste("生成点数:", length(combined)))
+    
+    return(list(
+      "数据" = oringin_data[["数据"]],  # 回归数据
+      "分层名称" = oringin_data[["分层名称"]],  # 颜色组名
+      "有效协变量" = oringin_data[["有效协变量"]],
+      "回归公式" = oringin_data[["回归公式"]],
+      "分位数位置" = combined               # 密集化的分位数位置
+    ))
+}
+```
+
+```{r}
+# 筛选所有当前基线水平下活跃的分层 
+filter_active_stratifications_location <- function(baseline, data_to_cal){
+  for (i in colnames(baseline)) {
+
+    for (j in names(data_to_cal)){
+
+      if (data_to_cal[[j]] %>% is.na %>% all){
+        next
+      }
+
+      baseline_level <- baseline[[i]] %>% unlist
+
+      testing_level <- data_to_cal[[j]][["有效协变量"]][[i]] %>% unlist
+
+      if (all(is.numeric(testing_level))){
+        test_result <-  (baseline_level >= testing_level[["lower_limit"]] & baseline_level <= testing_level[["upper_limit"]]) 
+      }else{
+        test_result <- (baseline_level %in% testing_level)
+      }
+      if (!test_result){
+        data_to_cal[[j]] <- NA
+      }
+    }
+  }
+  location <- which(!is.na(data_to_cal))
+  
+  names(data_to_cal[location])
+}
+```
+
+```{r}
+# 根据最新输入，更新reactive_baseline，并更新在该baseline下激活的filtered_data_to_cal
+observeEvent(input$renew_baseline,{
+  reactive_baseline_df <- data.frame(matrix(ncol = 0, nrow = 1))
+  all_names <- names(input)
+  baseline_names <- all_names %>% grep(., pattern = "^baseline_", value = TRUE)
+  for (i in baseline_names){
+    reactive_baseline_df[[sub("^baseline_", "", i)]] <- input[[i]]
+  }
+
+  for (i in names(reactive_dataset_to_plots)){
+    reactive_dataset_to_plots[[i]] <- NA
+  }
+  
+  # 更新filtered_data_to_cal
+  new_filtered_data <- global_data_to_cal()[filter_active_stratifications_location(reactive_baseline_df, global_data_to_cal())]
+  filtered_data_to_cal(new_filtered_data)
+  
+  # 更新reactive_baseline
+  reactive_baseline(reactive_baseline_df)
+  
+  # output$dowload_data_uioutput <- renderUI(downloadButton("download_rds","下载计算数据"))
+  # 
+  # output$download_rds <- downloadHandler(
+  #   filename = function() {
+  #     paste0("analysis_", format(Sys.time(), "%Y%m%d"), ".rds")
+  #   },
+  #   content = function(file) {
+  #     # 获取当前数据
+  #     data_to_save <- reactiveValuesToList(reactive_dataset_to_plots)
+  #     
+  #     # 添加元数据
+  #     attr(data_to_save, "metadata") <- list(
+  #       created = Sys.time(),
+  #       user = ifelse(exists("USER"), USER, "unknown"),
+  #       app_version = "1.2.0"
+  #     )
+  #     
+  #     # 保存为RDS
+  #     saveRDS(data_to_save, file)
+  #   }
+  # )
+})
+```
+
+```{r}
+observeEvent(input$start_rectified_distribution, {
+  global_data_names <- names(global_data_to_cal())
+  # showNotification(paste0("full_length: ",length(global_data_names)))
+  # showNotification(paste0("unique_length: ",length(global_data_names %>% unique)))
+  
+  data_to_cal <- global_data_to_cal()
+  filtered_data_to_cal(global_data_to_cal())
+  rq_formula <- safe_formula(input$kde_covariables_qr, input$kde_dependent_variable) # 通过输入的协变量和因变量获得回归公式
+  baseline <- get_baseline_level(rq_formula %>% deparse(), do.call(rbind,lapply(data_to_cal, function(i){i[[1]]}))) # 
+  
+    # 创建动态baseline
+  output$baseline_controller_ui <- renderUI({
+    # 获取反应式值一次，避免多次调用
+    data <- filtered_data()
+    base <- baseline
+    
+    # 确保数据存在
+    req(data, base)
+    
+    # 使用map安全地生成UI元素
+    columns <- purrr::map(colnames(base), function(.x) {
+      col_data <- data[[.x]]
+      base_value <- unlist(base[[.x]])
+      
+      # 处理数值型变量
+      if (is.numeric(col_data) || is.integer(col_data)) {
+        column(4, numericInput(
+          inputId = paste0("baseline_", .x),
+          label = .x,
+          min = min(col_data, na.rm = TRUE),
+          max = max(col_data, na.rm = TRUE),
+          value = base_value,
+          width = "100%"
+        ))
+      } 
+      # 处理因子/字符型变量
+      else {
+        choices <- if (is.factor(col_data)) levels(col_data) else unique(col_data)
+        column(2, selectInput(
+          inputId = paste0("baseline_", .x),
+          label = .x,
+          choices = choices,
+          selected = base_value,
+          width = "100%"
+        ))
+      }
+    })
+    
+    columns <- c(columns, list(column(2, actionButton("renew_baseline", "更新基线水平", width = "100%"))))
+    
+    # 返回完整的fluidRow
+    fluidRow(columns)
+  })
+
+  # 生成一系列更新事件，用于调整spline回归的参数
+    # 生成一系列更新事件，用于调整rq回归的参数  
+  lapply(names(filtered_data_to_cal()), function(i){
+    observeEvent(
+      list(
+        reactive_baseline()
+      ), {
+      
+      if(i %in% names(filtered_data_to_cal())){
+        renew_data_to_cal <- generate_quantiles(
+          i = which(i == global_data_names), 
+          input = input, 
+          oringin_data = filtered_data_to_cal()[[i]]
+        )
+        
+        # 用全局数据生成spline回归数据
+        str_name <- renew_data_to_cal[["分层名称"]]
+        reactive_dataset_to_plots[[paste0("plot_data_", str_name)]] <- get_spline_result_data(
+          rq_formula = renew_data_to_cal[["回归公式"]], 
+          compare_data = renew_data_to_cal[["数据"]], 
+          rq_quantiles = renew_data_to_cal[["分位数位置"]], 
+          indp_elements = renew_data_to_cal[["分层名称"]], 
+          baseline = reactive_baseline(),
+          knot_num = min(max(ceiling(min(ceiling(nrow(renew_data_to_cal[["数据"]])/15), 1000)/3),15), 100),
+          i = i
+        )
+      } 
+
+
+    }, ignoreInit = TRUE)  
+  })
+  
+    # 用filtered_data_to_cal()生成tabsetui
+  output$tabsets_ui <- renderUI({
+    fixed_tab <- tabPanel("各自变量分布", plotly::plotlyOutput("distribution_plot"))
+    # 创建动态标签页
+    dynamic_tabs <- lapply(names(filtered_data_to_cal()), function(i) {
+      tab_name <- i
+      plot_id <- paste0("spline_regression_plot", i)
+      tabPanel(tab_name, plotly::plotlyOutput(plot_id))
+    })
+    # 合并固定和动态标签页
+    all_tabs <- c(list(fixed_tab), dynamic_tabs)
+    # 创建tabsetPanel
+    do.call(tabsetPanel, all_tabs)
+  })
+  
+  
+    # 用reactive_dataset_to_plots生成spline回归图
+  lapply(names(filtered_data_to_cal()), function(i){
+    output[[paste0("spline_regression_plot", i)]] <- renderPlotly({
+      
+      plot_data <- reactive_dataset_to_plots[[paste0("plot_data_", i)]]
+      p <- spline_plot_function(plot_data[["processing_data"]], plot_data[["pred_x"]], plot_data[["pred_y"]])
+      p
+    })
+  })
+  
+  # 用reactive_dataset_to_plots绘制所有分布汇总的分布图
+  output$distribution_plot <- renderPlotly({
+    active_names <- (reactive_dataset_to_plots %>% names)[which(!is.na(reactiveValuesToList(reactive_dataset_to_plots)))]
+    all_names <- names(input)
+    baseline_names <- all_names %>% grep(., pattern = "^baseline_", value = TRUE)    
+      
+    plot_data <- lapply(active_names, function(i){
+      list(
+        reactive_dataset_to_plots[[i]][["dy_dx_smooth"]], # 用于绘制各分布的图
+        reactive_dataset_to_plots[[i]][["x_points"]], # 用于绘制各分布的图
+        i, # 用于呈现hoverinfo
+        reactive_dataset_to_plots[[i]][["pred_y"]]) # 用于呈现hoverinfo(CDF)
+    })
+    plot_the_distribution(plot_data, baseline_names)
+  })
+  
+  # 用全局数据生成分位数位置
+  ### 2025/09/16明日看看是不是data_to_cal长度为0导致后续不能正常计算
+  data_to_cal <- lapply(names(global_data_to_cal()), function(idx) {
+    generate_quantiles(i = which(idx == global_data_names), input = input, oringin_data = global_data_to_cal())
+  })
+  names(data_to_cal) <- names(global_data_to_cal())
+  
+  # 仅保留符合默认基线水平要求的分层，过滤不符合的分层
+  # 先用baseline_temp()更新filtered_data_to_cal，进而更新UI
+  filtered_loc <- filter_active_stratifications_location(baseline, data_to_cal)
+  new_data <- data_to_cal[filtered_loc]
+  filtered_data_to_cal(new_data)
+  
+  # 更新基线水平
+  # 再用reactive_baseline()更新reactive_dataset_to_plots
+  reactive_baseline(baseline)
+})
+```
+
+```{r}
+plot_the_distribution <- function(plot_data, baseline_names){
+  colors <- rainbow(length(plot_data), alpha = 0.3)  # 30% 透明度
+  line_colors <- rainbow(length(plot_data), alpha = 0.5)  # 100% 不透明
+  
+  plot_data <- lapply(seq_along(plot_data), function(i){
+
+    data.frame(
+      x = plot_data[[i]][[2]],
+      y = plot_data[[i]][[1]],
+      names = plot_data[[i]][[3]],
+      CDF_value = plot_data[[i]][[4]]
+    )
+  })
+  plot_titile <- paste0(
+    "基于分位数回归的pdf估计, 协变量水平：",
+    input$stratification_to_cal, 
+    ", ",
+    paste(paste(baseline_names %>% gsub("^baseline_", "", .), input[[baseline_names]], sep = " = "), collapse = ", ")
+  )
+ 
+  # 创建基础图表
+  p <- plot_ly() %>%
+    layout(
+      title = plot_titile,
+      xaxis = list(title = "x"),
+      yaxis = list(title = "dy/dx"),
+      hovermode = "x unified",
+      legend = list(
+        orientation = "v", 
+        x = 1, y = 1,
+        xanchor = "center"
+      ),
+      margin = list(t = 80, b = 80),
+      annotations = list(
+        list(
+          x = 0.5, y = -0.15,
+          xref = "paper", yref = "paper",
+          showarrow = FALSE,
+          text = "每条曲线下方填充区域表示导数积分值",
+          font = list(size = 12)
+        )
+      )
+    )
+  
+  # 添加每条曲线和填充区域
+  for (i in seq_along(plot_data)) {
+
+    # 添加曲线
+    p <- p %>%
+      add_trace(
+        data = plot_data[[i]],
+        x = ~x,
+        y = ~y,
+        type = "scatter",
+        mode = "lines",
+        line = list(color = line_colors[i], width = 2),
+        name = ~names,
+        hoverinfo = "text",  # 启用自定义悬停文本
+        text = ~paste0(
+          names,
+          "分位数: ", CDF_value
+        ),
+        legendgroup = paste0("group", i),
+        showlegend = TRUE
+      )
+    
+    # 添加填充区域
+    p <- p %>%
+      add_trace(
+        x = ~ c(min(x), x, max(x)),
+        y = ~ c(0, y, 0),
+        type = "scatter",
+        mode = "none",
+        fill = "tozeroy",
+        fillcolor = colors[i],
+        legendgroup = paste0("group", i),
+        showlegend = FALSE,
+        hoverinfo = "none"
+      )
+  }
+  
+  # 显示图表
+  p
+  plots_waiting_to_download[[plot_titile]] <- p
+}
+```
