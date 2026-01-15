@@ -43,7 +43,13 @@ app_ui <- function(request) {
       # 数据上传页面
       mod_data_upload_ui("origin"),
       # 聚类工具页面
-      nav_panel(title = "聚类工具"),
+      nav_panel(
+        title = "聚类工具",
+        navset_card_tab(
+          mod_keyword_clustering_ui("origin"),
+          mod_unsupervised_clustering_ui("origin")
+        )
+      ),
       # 分析工具页面
       nav_panel(
         full_screen = FALSE,
@@ -84,7 +90,7 @@ app_ui <- function(request) {
 golem_add_external_resources <- function() {
   # 上传文件大小限制
   options(shiny.maxRequestSize = 1000 * 1024^2)
-
+  options(browser = "wslview")
 
   add_resource_path(
     "www",
