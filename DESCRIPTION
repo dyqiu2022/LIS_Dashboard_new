@@ -6,9 +6,20 @@ Authors@R:
 Description: 基于R语言和Shiny框架的数据看板，用于快速分析LIS数据
 License: MIT + file LICENSE
 Imports: 
+    bslib,
     config,
+    digest,
+    dplyr,
+    DT,
+    ggplot2,
     golem,
-    shiny
+    lubridate,
+    plotly,
+    readxl,
+    rlang,
+    scales,
+    shiny,
+    shinyWidgets
 Suggests: 
     spelling,
     testthat (>= 3.0.0)

@@ -399,7 +399,9 @@ discretize_age <- function(age_vector, grain = 3) {
     stop("输入 'age_vector' 必须是数值向量。")
   }
 
-  if (!is.numeric(grain) || grain <= 0) {
+  # grain 可能来自 UI 输入；NA/Inf 会导致 if 条件本身变成 NA，从而触发
+  # "missing value where TRUE/FALSE needed"
+  if (!is.numeric(grain) || length(grain) != 1 || is.na(grain) || !is.finite(grain) || grain <= 0) {
     stop("颗粒度 'grain' 必须为正数。")
   }
 
@@ -607,6 +609,84 @@ discretize_time <- function(datetime, grain = c("month", "week", "day")) {
     time_label,
     levels = unique(time_label[order(datetime)]),
     ordered = TRUE
+  )
+}
+
+#' 将连续数值离散化为区间（支持小数颗粒度）
+#'
+#' @description
+#' 将连续的数值向量离散化为有序的分类变量（Factor）。
+#' 与 discretize_age 不同，此函数支持小数颗粒度，适用于 Box-Cox 转换后的数据。
+#'
+#' @param value_vector 数值向量。包含待分组的数值。
+#' @param grain 正数。分箱的颗粒度（步长），可以是小数。
+#'
+#' @return 返回一个有序因子 (Ordered Factor)，包含离散化后的区间。
+#' 如果输入全是 NA，则返回全 NA 的因子。
+#'
+#' @export
+#'
+#' @examples
+#' # 正常情况
+#' values <- c(0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 7.0)
+#' discretize_continuous(values, grain = 0.5)
+discretize_continuous <- function(value_vector, grain = 1) {
+  # 1. 基础类型检查
+  if (!is.numeric(value_vector)) {
+    stop("输入 'value_vector' 必须是数值向量。")
+  }
+
+  # grain 可能来自 UI 输入；NA/Inf 会导致 if 条件本身变成 NA，从而触发
+  # "missing value where TRUE/FALSE needed"
+  if (!is.numeric(grain) || length(grain) != 1 || is.na(grain) || !is.finite(grain) || grain <= 0) {
+    stop("颗粒度 'grain' 必须为正数。")
+  }
+
+  # 2. 脏数据防御 (NA 处理)
+  if (any(value_vector < 0, na.rm = TRUE)) {
+    stop("数据中包含负数值，请检查数据质量。")
+  }
+
+  # 如果全是 NA，直接返回相同长度的 NA 向量
+  valid_values <- value_vector[!is.na(value_vector)]
+  if (length(valid_values) == 0) {
+    return(factor(rep(NA, length(value_vector)), ordered = TRUE))
+  }
+
+  # 3. 计算分箱断点
+  min_val <- min(valid_values)
+  max_val <- max(valid_values)
+
+  # 对于小数颗粒度，使用更精确的计算方式
+  start_point <- floor(min_val / grain) * grain
+  breaks <- seq(from = start_point, to = max_val + grain, by = grain)
+
+  # 4. 生成标签（支持小数颗粒度）
+  # 对于小数颗粒度，使用更精确的标签格式
+  lower_bounds <- breaks[-length(breaks)]
+  upper_bounds <- breaks[-1]
+  
+  # 根据颗粒度决定标签格式
+  if (grain >= 1) {
+    # 整数颗粒度：使用 "a-b" 格式（b 是上限减1，左闭右开）
+    upper_bounds <- upper_bounds - 1
+    bin_labels <- paste0(lower_bounds, "-", upper_bounds)
+  } else {
+    # 小数颗粒度：使用 "a-b" 格式（b 是上限，左闭右开，但显示时包含）
+    # 为了显示更友好，将上限稍微调整
+    bin_labels <- paste0(
+      round(lower_bounds, 3), "-", 
+      round(upper_bounds - 0.001, 3)
+    )
+  }
+
+  # 5. 执行分箱
+  cut(
+    value_vector,
+    breaks = breaks,
+    right = FALSE,        # 左闭右开
+    labels = bin_labels,
+    ordered_result = TRUE # 生成有序因子
   )
 }
 
@@ -1788,7 +1868,7 @@ all_pairs <- function(vec) {
 
 # 计算box-cox最佳λ - 完全避免环境问题
 # 直接使用数值向量而不是数据框
-maxlikelihood_boxcox <- function(data_vector){
+maxlikelihood_boxcox <- function(data_vector, return_lambda = FALSE){
 
   y_values <- as.numeric(data_vector) + 0.1
   # 手动实现Box-Cox优化
@@ -1819,7 +1899,45 @@ maxlikelihood_boxcox <- function(data_vector){
   } else {
     ((as.numeric(data_vector) + 0.1)^best_lambda - 1) / best_lambda
   }
-  data_vector_return
+  
+  # 如果要求返回 lambda，返回列表；否则返回向量（保持向后兼容）
+  if (return_lambda) {
+    return(list(
+      transformed_data = data_vector_return,
+      lambda = best_lambda
+    ))
+  } else {
+    return(data_vector_return)
+  }
+}
+
+#' Box-Cox 逆变换函数
+#'
+#' @description
+#' 将 Box-Cox 转换后的数据还原为原始尺度
+#'
+#' @param transformed_data Box-Cox 转换后的数据
+#' @param lambda Box-Cox 转换使用的 lambda 参数
+#'
+#' @return 还原后的原始数据
+#'
+#' @export
+#'
+#' @examples
+#' original <- c(1, 5, 10, 20, 50, 100)
+#' result <- maxlikelihood_boxcox(original, return_lambda = TRUE)
+#' reversed <- boxcox_reverse(result$transformed_data, result$lambda)
+boxcox_reverse <- function(transformed_data, lambda) {
+  # Box-Cox 逆变换公式
+  # 注意：原始转换时加了 0.1，所以逆变换后要减去 0.1
+  if (lambda == 0) {
+    # log 变换的逆变换
+    original <- exp(transformed_data) - 0.1
+  } else {
+    # 一般 Box-Cox 变换的逆变换
+    original <- (transformed_data * lambda + 1)^(1/lambda) - 0.1
+  }
+  return(original)
 }
 
 calculate_SDR <- function(grouped_data) {

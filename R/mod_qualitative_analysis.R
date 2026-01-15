@@ -48,7 +48,10 @@ mod_qualitative_analysis_ui <- function(id) {
       mod_qualitative_analysis_pie_chart_ui(ns("pie_chart")),
 
       # 右侧第一个连续变量堆叠图（上图）
-      mod_qualitative_analysis_consecutive_hist_ui(ns("consecutive_hist_top"))
+      mod_qualitative_analysis_consecutive_hist_ui(
+        ns("consecutive_hist_top"),
+        default_x_var = "采样时间"
+      )
     ),
 
 

@@ -23,6 +23,7 @@ mod_quantitative_analysis_ui <- function(id) {
         gap = "20px",
         class = "h-100",
         sidebar = sidebar(
+          width = "150px",
           title = "分析参数配置3",
           bg = "#f8f9fa",
           open = "desktop",

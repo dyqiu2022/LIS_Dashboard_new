@@ -165,6 +165,7 @@ mod_qualitative_analysis_discrete_hist_ui <- function(id) {
     sidebar = sidebar(
       bg = "#f8f9fa",
       open = "desktop",
+      width = "150px",
       uiOutput(ns("second_dynamic_Var_output")),
 
       selectInput(ns("sec_Var_mode"), "二级变量堆叠方式", choices = c("数量","比例")),
@@ -189,9 +190,9 @@ mod_qualitative_analysis_discrete_hist_server <- function(id, global_store, head
     ns <- session$ns
 
     output$second_dynamic_Var_output <- renderUI({
-      print(0.25)
+
       req(global_store[["filtered_data"]])
-      print(0.5)
+
       selectInput(ns("second_dynamic_Var"), "二级分层变量", choices = colnames(global_store[["filtered_data"]]))
     })
 
@@ -225,7 +226,6 @@ mod_qualitative_analysis_discrete_hist_server <- function(id, global_store, head
       # 假设 hash_color() 返回的是字符串 "哈希颜色" 或其他
       use_hash <- (hash_color() == "哈希颜色")
 
-      print(use_hash)
 
       p <- plot_discrete_hist(
         processed_list = processed_result,
