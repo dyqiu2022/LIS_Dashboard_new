@@ -1177,9 +1177,9 @@ spline_plot_function <- function(processing_data, pred_x, pred_y){
   )
 
   # 创建基础图形
-  p <- plot_ly() %>%
+  p <- plotly::plot_ly() %>%
     # 添加原始数据点
-    add_trace(
+    plotly::add_trace(
       x = processing_data$x,
       y = processing_data$y,
       type = "scatter",
@@ -1189,7 +1189,7 @@ spline_plot_function <- function(processing_data, pred_x, pred_y){
       hoverinfo = "x+y"
     ) %>%
     # 添加拟合样条线
-    add_trace(
+    plotly::add_trace(
       x = pred_x,
       y = pred_y,
       type = "scatter",
@@ -1198,7 +1198,7 @@ spline_plot_function <- function(processing_data, pred_x, pred_y){
       name = "拟合样条"
     )  %>%
     # 设置布局
-    layout(
+    plotly::layout(
       title = "带锚点的三次样条回归",
       xaxis = list(title = "x"),
       yaxis = list(title = "y"),
@@ -1216,7 +1216,14 @@ spline_plot_function <- function(processing_data, pred_x, pred_y){
 }
 
 # 自适应绘图函数
-plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, extreme_quantiles) {
+plot_quantile_lines <- function(data,
+                                origin_data,
+                                best_lambda,
+                                header_name,
+                                extreme_quantiles,
+                                hover_mode = "x unified",
+                                smoothing_value = 1.3,
+                                title_var = header_name) {
   # 获取唯一群体和分位数
   condition <- unique(data$condition)
   quantiles <- unique(data$`CI_%`)
@@ -1239,7 +1246,7 @@ plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, ext
   quantile_palette <- quantile_palette %>% rep(color_multi)
 
   # 创建基础图表
-  p <- plot_ly()
+  p <- plotly::plot_ly()
 
   # 第一步：添加原始数据点（散点图）
   for (grp in condition) {
@@ -1250,7 +1257,7 @@ plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, ext
       group_color <- group_palette[which(condition == grp)]
 
       # 添加原始数据点
-      p <- p %>% add_trace(
+      p <- p %>% plotly::add_trace(
         data = group_origin,
         x = ~年龄,
         y = ~boxcox_result,
@@ -1266,7 +1273,7 @@ plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, ext
           ), # 半透明
           size = 5
         ),
-        hoverinfo = ifelse(input$hover_mode == "constant","text","none"),
+        hoverinfo = ifelse(hover_mode == "constant", "text", "none"),
         text = ~ paste(
           "群体: ", .data[[header_name]],
           "<br>年龄: ", 年龄, "岁",
@@ -1290,7 +1297,7 @@ plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, ext
       q_color <- quantile_palette[which(condition == grp)]
 
       # 添加折线
-      p <- p %>% add_trace(
+      p <- p %>% plotly::add_trace(
         data = q_data,
         x = ~年龄,
         y = ~point_estimator,
@@ -1305,7 +1312,7 @@ plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, ext
         ),
         line = list(
           shape = 'spline',
-          smoothing = input$smoothing_value, # 平滑度
+          smoothing = smoothing_value, # 平滑度
           color = q_color,
           width = 3 - 4*(abs(50 - as.numeric(gsub("%", "", q))))/100,
           dash = ifelse(which(quantiles == q) %% 2 == 0, "dash", "solid")
@@ -1316,7 +1323,7 @@ plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, ext
 
       if (q %in% extreme_quantiles) {
         # 方法1：使用 error_y（垂直误差线）
-        p <- p %>% add_trace(
+        p <- p %>% plotly::add_trace(
           data = q_data,
           x = ~年龄,
           y = ~point_estimator,
@@ -1341,7 +1348,7 @@ plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, ext
   }
 
   # 设置布局
-  p %>% layout(
+  p %>% plotly::layout(
     hoverlabel = list(
       font = list(
         size = 16,  # 设置悬浮框字体大小
@@ -1352,7 +1359,7 @@ plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, ext
       namelength = -1  # 显示完整名称
     ),
     title = list(
-      text = paste0(input$dynamic_header_,"分层分位数趋势/散点图"),
+      text = paste0(title_var, "分层分位数趋势/散点图"),
       y = 0.98,  # 向下移动标题位置 (0-1范围，1为顶部)
       x = 0.5,   # 居中
       xanchor = "center",
@@ -1390,7 +1397,7 @@ plot_quantile_lines <- function(data, origin_data, best_lambda, header_name, ext
       tickvals = breaks_transformed,
       ticktext = breaks_original
     ),
-    hovermode = input$hover_mode,
+    hovermode = hover_mode,
     legend = list(
       title = list(
         text = "<b>各病人群体散点/分位数</b>",

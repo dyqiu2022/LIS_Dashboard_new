@@ -46,6 +46,7 @@ app_ui <- function(request) {
       nav_panel(title = "聚类工具"),
       # 分析工具页面
       nav_panel(
+        full_screen = FALSE,
         title = "分析工具",
         layout_sidebar(
           fillable = TRUE,
@@ -56,7 +57,6 @@ app_ui <- function(request) {
             mod_analysis_tools_sidebar_ui("origin")
           ),
           navset_card_tab(
-            full_screen = T,
             # 定量变量离散化UI
             mod_quantitative_discretization_ui("origin"),
             # 探索性定性分析UI

@@ -12,58 +12,56 @@ mod_qualitative_analysis_ui <- function(id) {
   nav_panel(
     title = "探索性定性分析",
     fillable = TRUE,
-    # 代替原来的 fluidRow
-    layout_columns(
-      fill = FALSE,
-      col_widths = c(2, 2, 2, 2, 2, 2), # 每个控件占 2/12 宽度
-      # 或者简写为 col_widths = 2 (如果全部等宽)
-      uiOutput(ns("dynamic_controls")),
-      selectInput(
-        ns("hash_color"),
-        "颜色模式",
-        choices = c("默认颜色", "哈希颜色"),
-        selected = "默认颜色", width = "100%"
-      ),
-
-      # 按钮部分：bslib 不需要再手动写 margin-top 来对齐
-      # 它可以用 align_vals 参数或简单的 wrapper
-      div(
-        class = "d-flex align-items-end h-100", # 使用 Bootstrap 5 的 Flex 布局对齐
+    layout_sidebar(
+      fillable = TRUE,
+      sidebar = sidebar(
+        title = "分析参数",
+        width = "170px",
+        bg = "#f8f9fa",
+        open = "desktop",
+        uiOutput(ns("dynamic_controls")),
+        selectInput(
+          ns("hash_color"),
+          "颜色模式",
+          choices = c("默认颜色", "哈希颜色"),
+          selected = "默认颜色",
+          width = "100%"
+        ),
         actionButton(
           ns("change_order"),
           "改变图例顺序",
           icon = icon("refresh"),
           class = "btn-default w-100"
         )
+      ),
+      tagList(
+        layout_column_wrap(
+          width = 1/2,        # 保持每行2列
+          height = NULL,      # 关键点1：必须让高度自适应，不要锁死像素高度
+          fill = FALSE,       # 告诉网格：由内容（aspect-ratio）决定高度，不要去适应父容器
+          gap = "20px",       # 卡片之间的间距
+
+          # 关键点2：在每个 card 内部定义纵横比
+          # 2/1 表示 宽度2 : 高度1 (即高度是宽度的0.5倍)
+          mod_qualitative_analysis_pie_chart_ui(ns("pie_chart")),
+
+          # 右侧第一个连续变量堆叠图（上图）
+          mod_qualitative_analysis_consecutive_hist_ui(
+            ns("consecutive_hist_top"),
+            default_x_var = "采样时间"
+          )
+        ),
+        layout_column_wrap(
+          width = 1/2,        # 保持每行2列
+          height = NULL,      # 关键点1：必须让高度自适应，不要锁死像素高度
+          fill = FALSE,
+          gap = "20px",       # 卡片之间的间距
+          mod_qualitative_analysis_discrete_hist_ui(ns("discrete_hist")),
+
+          # 右侧第二个连续变量堆叠图（下图）
+          mod_qualitative_analysis_consecutive_hist_ui(ns("consecutive_hist_bottom"))
+        )
       )
-    ),
-    layout_column_wrap(
-      width = 1/2,        # 保持每行2列
-      height = NULL,      # 关键点1：必须让高度自适应，不要锁死像素高度
-      fill = FALSE,       # 告诉网格：由内容（aspect-ratio）决定高度，不要去适应父容器
-      gap = "20px",       # 卡片之间的间距
-
-      # 关键点2：在每个 card 内部定义纵横比
-      # 2/1 表示 宽度2 : 高度1 (即高度是宽度的0.5倍)
-      mod_qualitative_analysis_pie_chart_ui(ns("pie_chart")),
-
-      # 右侧第一个连续变量堆叠图（上图）
-      mod_qualitative_analysis_consecutive_hist_ui(
-        ns("consecutive_hist_top"),
-        default_x_var = "采样时间"
-      )
-    ),
-
-
-    layout_column_wrap(
-      width = 1/2,        # 保持每行2列
-      height = NULL,      # 关键点1：必须让高度自适应，不要锁死像素高度
-      fill = FALSE,
-      gap = "20px",       # 卡片之间的间距
-      mod_qualitative_analysis_discrete_hist_ui(ns("discrete_hist")),
-
-      # 右侧第二个连续变量堆叠图（下图）
-      mod_qualitative_analysis_consecutive_hist_ui(ns("consecutive_hist_bottom"))
     )
   )
 }
