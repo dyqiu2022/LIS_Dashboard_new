@@ -141,18 +141,64 @@ calc_consecutive_hist_data <- function(data,
     # 使用自定义颗粒度进行离散化
     # grain_value 此时应该是数值（自定义的颗粒度）
     # 对于转换后的数据，使用支持小数颗粒度的离散化函数
+    # 关键修复：先处理NA值，避免产生NA bin
+    na_indices <- is.na(quant_data)
+    
     if (isTRUE(normalize_quantitative)) {
       # Box-Cox转换后的数据使用专门的离散化函数
-      current_data$定量结果组 <- discretize_continuous(
-        quant_data,
-        grain = grain_value
-      )
+      # 只对非NA值进行离散化
+      if (any(na_indices)) {
+        # 如果有NA值，先对非NA值进行离散化
+        quant_data_non_na <- quant_data[!na_indices]
+        discretized_non_na <- discretize_continuous(
+          quant_data_non_na,
+          grain = grain_value
+        )
+        # 创建完整的结果向量
+        current_data$定量结果组 <- rep(NA_character_, nrow(current_data))
+        current_data$定量结果组[!na_indices] <- as.character(discretized_non_na)
+        # 为NA值分配特殊标签（如果需要显示NA bin，可以改为"缺失值"）
+        # 但根据用户需求，NA值不应该出现在横坐标上，所以保持为NA
+        current_data$定量结果组[na_indices] <- NA_character_
+        # 转换为因子，确保NA值不成为因子水平
+        current_data$定量结果组 <- factor(
+          current_data$定量结果组,
+          levels = levels(discretized_non_na),
+          ordered = TRUE
+        )
+      } else {
+        # 没有NA值，直接离散化
+        current_data$定量结果组 <- discretize_continuous(
+          quant_data,
+          grain = grain_value
+        )
+      }
     } else {
       # 原始数据可以使用 discretize_age（假设数据范围合理）
-      current_data$定量结果组 <- discretize_age(
-        quant_data,
-        grain = grain_value
-      )
+      if (any(na_indices)) {
+        # 如果有NA值，先对非NA值进行离散化
+        quant_data_non_na <- quant_data[!na_indices]
+        discretized_non_na <- discretize_age(
+          quant_data_non_na,
+          grain = grain_value
+        )
+        # 创建完整的结果向量
+        current_data$定量结果组 <- rep(NA_character_, nrow(current_data))
+        current_data$定量结果组[!na_indices] <- as.character(discretized_non_na)
+        current_data$定量结果组[na_indices] <- NA_character_
+        # 转换为因子，确保NA值不成为因子水平
+        current_data$定量结果组 <- factor(
+          current_data$定量结果组,
+          levels = levels(discretized_non_na),
+          ordered = TRUE
+        )
+      } else {
+        # 没有NA值，直接离散化
+        current_data$定量结果组 <- discretize_age(
+          quant_data,
+          grain = grain_value
+        )
+      }
     }
     bin_col  <- "定量结果组"
     x_label  <- if (normalize_quantitative) "定量结果（Box-Cox转换后，横坐标为原值）" else "定量结果"
@@ -163,6 +209,10 @@ calc_consecutive_hist_data <- function(data,
 
   # 聚合并补全空分组
   selected_header <- group_var
+
+  # 关键修复：过滤掉NA值，避免产生NA bin
+  # 在聚合之前，先过滤掉bin_col为NA的行
+  current_data <- current_data[!is.na(current_data[[bin_col]]), , drop = FALSE]
 
   plot_data <- current_data %>%
     dplyr::group_by(.data[[bin_col]], .data[[selected_header]]) %>%
@@ -205,6 +255,12 @@ calc_consecutive_hist_data <- function(data,
     # 获取当前的分组标签
     current_levels <- levels(plot_data[[bin_col]])
     
+    # 获取转换后数据的实际范围（用于边界检查）
+    # 注意：quant_data 可能已经经过平移，所以这里获取的是平移后的范围
+    transformed_range <- range(quant_data, na.rm = TRUE)
+    transformed_min <- transformed_range[1]
+    transformed_max <- transformed_range[2]
+    
     # 解析标签，提取边界值，然后逆变换
     parse_and_reverse <- function(label) {
       # 标签格式通常是 "a-b" 或 "a-b.c"
@@ -213,7 +269,13 @@ calc_consecutive_hist_data <- function(data,
         lower_transformed <- as.numeric(parts[1])
         upper_transformed <- as.numeric(parts[2])
         
-        # 如果有平移，先加上平移量
+        # 关键修复：限制边界值在转换后数据的实际范围内
+        # 避免逆转换时产生超出原数据范围的bin
+        # 注意：这里限制的是平移后的数据范围
+        lower_transformed <- max(lower_transformed, transformed_min)
+        upper_transformed <- min(upper_transformed, transformed_max)
+        
+        # 如果有平移，先加上平移量（恢复到平移前的值）
         # 注意：boxcox_offset 若为 NA，会导致 if 条件变 NA 从而报错
         if (!is.null(boxcox_offset) && is.finite(boxcox_offset) && !is.na(boxcox_offset) && boxcox_offset != 0) {
           lower_transformed <- lower_transformed + boxcox_offset
@@ -269,6 +331,7 @@ calc_consecutive_hist_data <- function(data,
 #' @importFrom shiny moduleServer req validate need reactive observeEvent renderUI tagList
 #' @importFrom plotly renderPlotly ggplotly
 #' @importFrom ggplot2 ggplot aes_string geom_col scale_fill_manual labs theme_minimal theme element_text
+#' @importFrom scales percent
 mod_qualitative_analysis_consecutive_hist_server <- function(id,
                                                               global_store,
                                                               header_for_stack,
@@ -532,12 +595,21 @@ mod_qualitative_analysis_consecutive_hist_server <- function(id,
         x_label <- "定量结果（Box-Cox转换后，横坐标为原值）"
       }
 
+      # 添加 hover 文本列，格式与 discrete_hist 保持一致
+      # 无论选择的是数量还是比例模式，都同时显示数量和比例
+      plot_data$hover_text <- paste0(
+        "一级分层变量: ", plot_data[[bin_col]], "<br>",
+        "二级分层变量: ", plot_data[[group_var]], "<br>",
+        "数量: ", plot_data$n, " (", scales::percent(plot_data[[ratio_col]], accuracy = 0.1), ")"
+      )
+
       p <- ggplot2::ggplot(
         plot_data,
         ggplot2::aes_string(
           x    = bin_col,
           y    = y_var,
-          fill = group_var
+          fill = group_var,
+          text = "hover_text"
         )
       ) +
         ggplot2::geom_col(position = "stack") +
@@ -553,7 +625,7 @@ mod_qualitative_analysis_consecutive_hist_server <- function(id,
           axis.text.x = ggplot2::element_text(angle = -60, hjust = 0)
         )
 
-      plotly::ggplotly(p)
+      plotly::ggplotly(p, tooltip = "text")
     }) %>% shiny::debounce(800)
   })
 }

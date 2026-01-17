@@ -29,3 +29,28 @@
   50% { opacity: 1; transform: scale(1); }
   100% { opacity: 0.5; transform: scale(0.98); }
 }
+
+/* 全局缩放：适配1080p屏幕（约80%缩放，类似浏览器 Ctrl+滚轮） */
+/* 主要缩放通过 bslib theme 的 base_font_size 实现，这里补充一些细节调整 */
+
+/* 确保卡片标题适当缩放 */
+.card-header {
+  font-size: 0.9rem;
+  padding: 0.4rem 0.8rem;
+}
+
+/* 侧边栏标题和内容适当缩放 */
+.sidebar-title,
+.sidebar-content {
+  font-size: 0.95rem;
+}
+
+/* 表格字体适当缩放 */
+.table {
+  font-size: 0.95rem;
+}
+
+/* DT表格的字体也缩放 */
+.dataTables_wrapper {
+  font-size: 0.95rem;
+}

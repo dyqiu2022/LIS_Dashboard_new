@@ -7,12 +7,15 @@
 #' @noRd
 
 # 在 app_ui.R 中定义
+# 全局缩放因子：80%（适配1080p屏幕）
+SCALE_FACTOR <- 0.85
+
 my_theme <- bslib::bs_theme(
   bootswatch = "flatly",
   bg = "#fff",
   fg = "rgb(31, 45, 58)",
-  # 1. 基础字号直接在这里设为 0.85rem，bslib 会自动缩放其他元素
-  base_font_size = "0.85rem",
+  # 基础字号缩放到80%：0.85rem * 0.8 = 0.68rem
+  base_font_size = paste0(1 * SCALE_FACTOR, "rem"),
 
   # 2. 告诉 bslib 去加载 Noto Sans SC (Google Font)
   # 虽然不写 collection，但 bslib 会自动把它排在字体列表第一位
@@ -23,12 +26,12 @@ my_theme <- bslib::bs_theme(
     # 3. 重点：在这里把你的长串备选字体清单写进 Bootstrap 变量
     "font-family-base" = "'Noto Sans SC', 'Lato', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol'",
 
-    # 4. 其他精细化调整保持不变
-    "h5-font-size"    = "1rem",
-    "h4-font-size"    = "1.1rem",
-    "input-font-size" = "0.85rem",
-    "btn-padding-y"   = "0.25rem",
-    "btn-padding-x"   = "0.5rem"
+    # 4. 所有字体和尺寸按80%缩放
+    "h5-font-size"    = paste0(1.1 * SCALE_FACTOR, "rem"),    # 1rem -> 0.8rem
+    "h4-font-size"    = paste0(1.2 * SCALE_FACTOR, "rem"),    # 1.1rem -> 0.88rem
+    "input-font-size" = paste0(1 * SCALE_FACTOR, "rem"),   # 0.85rem -> 0.68rem
+    "btn-padding-y"   = paste0(0.25 * SCALE_FACTOR, "rem"),   # 0.25rem -> 0.2rem
+    "btn-padding-x"   = paste0(0.5 * SCALE_FACTOR, "rem")     # 0.5rem -> 0.4rem
   )
 
 app_ui <- function(request) {
@@ -71,6 +74,7 @@ app_ui <- function(request) {
             mod_quantitative_analysis_ui("origin"),
             nav_panel(title = "参考区间与人群异质性评估"),
             nav_panel(title = "批间差异分析"),
+            mod_batch_difference_optimization_ui("origin"),
             mod_show_filtered_data_ui("origin")
           )
         )

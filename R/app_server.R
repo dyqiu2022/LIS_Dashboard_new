@@ -17,5 +17,6 @@ app_server <- function(input, output, session) {
   mod_quantitative_discretization_server("origin", global_store)
   mod_qualitative_analysis_server("origin", global_store)
   mod_quantitative_analysis_server("origin", global_store)
+  mod_batch_difference_optimization_server("origin", global_store)
   mod_show_filtered_data_server("origin", global_store)
 }

@@ -9,24 +9,32 @@
 #' @import shiny
 #' @importFrom dplyr %>% arrange group_by reframe select mutate distinct filter
 #' @importFrom rlang sym .data
+#' @importFrom DT renderDataTable datatable formatStyle dataTableOutput
+#' @importFrom bslib card_body
+#' @importFrom shiny validate need
 mod_unsupervised_clustering_ui <- function(id) {
   ns <- NS(id)
 
   nav_panel(
     title = "词向量无监督聚类",
-    fluidRow(
-      column(2, uiOutput(ns("choose_grouping_col2"))),
-      column(10, uiOutput(ns("diag_kmeans_ui")))
-    ),
-    fluidRow(
-      style = "height: 1600px; display: flex;",
-      column(
-        12,
-        style = "display: flex; flex-direction: column; height: 80%;",
-        div(
-          style = "flex: 1; display: flex; flex-direction: column; min-height: 0;",
-          h4("当前无监督聚类情况"),
-          DT::dataTableOutput(ns("diag_count2"))
+    fillable = TRUE,
+    layout_sidebar(
+      fillable = TRUE,
+      sidebar = sidebar(
+        title = "无监督聚类参数",
+        width = "360px",
+        bg = "#f8f9fa",
+        open = "desktop",
+        uiOutput(ns("choose_grouping_col2")),
+        uiOutput(ns("diag_kmeans_ui"))
+      ),
+      card(
+        full_screen = TRUE,
+        height = "100%",
+        card_header("当前无监督聚类情况"),
+        card_body(
+          padding = 0,
+          DT::dataTableOutput(ns("diag_count2"), height = "100%", fill = TRUE)
         )
       )
     )
@@ -63,25 +71,43 @@ mod_unsupervised_clustering_server <- function(id, global_store) {
 
     output$diag_count2 <- DT::renderDataTable({
       req(grouping_table2())
+      data <- grouping_table2()
+      validate(need(nrow(data) > 0, "暂无聚类数据"))
+      
       DT::datatable(
-        grouping_table2(),
-        extensions = c("Buttons"),
-        options = list(
-          pageLength = 40,
-          dom = "Blfrtip",
-          paging = TRUE,
-          lengthChange = FALSE,
-          searching = TRUE,
-          ordering = TRUE,
-          info = TRUE,
-          autoWidth = TRUE,
-          language = list(url = "//cdn.datatables.net/plug-ins/1.13.6/i18n/zh.json"),
-          buttons = list(),
-          paginate = list(first = "首页", previous = "上一页", `next` = "下一页", last = "末页")
-        ),
+        data,
+        extensions = c('Buttons'),
+        fillContainer = TRUE,
+        style = "bootstrap",
+        class = "table table-striped table-hover table-sm display nowrap",
         rownames = FALSE,
-        filter = "top"
-      )
+        selection = 'none',
+        filter = 'top',
+        options = list(
+          paging = TRUE,
+          scroller = FALSE,
+          pageLength = 20,
+          lengthMenu = c(15, 20, 50, 100),
+          dom = '<"d-flex justify-content-between mb-2"Bf>t<"d-flex justify-content-between align-items-center mt-2"ilp>',
+          buttons = list(
+            list(
+              extend = 'colvis',
+              text = '显示/隐藏列',
+              columns = ':not(:first-child)',
+              className = 'btn-sm btn-outline-secondary'
+            )
+          ),
+          language = list(
+            url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Chinese.json',
+            buttons = list(colvis = '列可见性')
+          )
+        )
+      ) %>%
+        DT::formatStyle(
+          columns = names(data),
+          fontSize = '14px',
+          lineHeight = '20px'
+        )
     })
 
     output$choose_grouping_col2 <- renderUI({
@@ -94,18 +120,16 @@ mod_unsupervised_clustering_server <- function(id, global_store) {
 
     observeEvent(input$selected_grouping_col2, {
       output$diag_kmeans_ui <- renderUI({
-        div(style = "margin-top: 31px;", actionButton(ns("load_model_worker"), "载入词向量模型，并进行分词和词语向量化"))
+        div(class = "pt-2", actionButton(ns("load_model_worker"), "进行分词和词语向量化", width = "100%"))
       })
     })
 
     observeEvent(input$load_model_worker, {
       output$diag_kmeans_ui <- renderUI({
-        div(
-          fluidRow(
-            column(2, numericInput(ns("cluster_num"), "输入K-Means的Cluster数量:", value = 30, min = 0, max = 100, width = "100%")),
-            column(2, div(style = "margin-top: 31px;", actionButton(ns("Start_kmeans"), "开始进行kmeans聚类", width = "100%"))),
-            column(2, uiOutput(ns("merge_result_ui2")))
-          )
+        tagList(
+          numericInput(ns("cluster_num"), "输入K-Means的Cluster数量:", value = 30, min = 0, max = 100, width = "100%"),
+          div(class = "pt-2", actionButton(ns("Start_kmeans"), "开始进行kmeans聚类", width = "100%")),
+          div(class = "pt-2", uiOutput(ns("merge_result_ui2")))
         )
       })
 
@@ -253,7 +277,7 @@ mod_unsupervised_clustering_server <- function(id, global_store) {
 
       data4 %>% grouping_table2(.)
       showNotification("完成K-means聚类", type = "message")
-      output$merge_result_ui2 <- renderUI(div(style = "margin-top: 31px;", actionButton(ns("merge_result2"), "聚类结果写入数据", width = "100%")))
+      output$merge_result_ui2 <- renderUI(div(class = "pt-2", actionButton(ns("merge_result2"), "聚类结果写入数据", width = "100%")))
     })
 
     observeEvent(input$merge_result2, {

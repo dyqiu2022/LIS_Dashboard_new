@@ -1,0 +1,541 @@
+---
+title: "试剂批间差异分析"
+author: "Dongyi"
+date: "2025-10-22"
+output: html_document
+---
+```{r}
+##代码测试
+library(lubridate)
+library(plotly)
+library(dplyr)
+library(forecast)
+library(tseries)
+library(readxl)
+library(forecast)
+library(tidyverse)
+```
+
+```{r}
+find_outlier_indices <- function(x ,para) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - para * IQR
+  upper_bound <- Q3 + para * IQR
+  
+  which(x < lower_bound | x > upper_bound)
+}
+
+fit_regression_model <- function(data) {
+  # 拟合多元线性回归模型
+  model <- lm(定量结果_transformed ~ 性别:I(年龄^2) + 性别:年龄 + 类别_无监督 , data = data)
+  return(model)
+}
+
+# 基于Beta分布的精确检验
+exact_order_statistic_test <- function(sample1, sample2, quantile_, p_value_calculator) {
+
+  # 计算顺序统计量
+  X_k1 <- sort(sample1)[k1]
+  X_k2 <- sort(sample2)[k2]
+  
+  # 概率积分变换
+  U_k1 <- (which(sample2<=X_k1) %>% length)/n2
+  U_k2 <- (which(sample1<=X_k2) %>% length)/n1
+  
+
+  # 计算观测差异
+  abs_observed <- abs(U_k1 - U_k2)
+  
+  # 计算p值（双侧检验）
+
+  p_value <-   p_value_calculator(abs_observed)
+  return(p_value)
+}
+
+calculate_delta_p_value <- function(abs_observed, abs_delta_samples){
+  p_value <- mean(abs_delta_samples >= abs_observed)
+  return(p_value)
+}
+
+boxcox_rev <- function(y, lambda) {
+  if (lambda == 0) exp(y) else (lambda*y + 1)^(1/lambda)
+}
+
+```
+
+```{r}
+file <- file.choose()
+example_data <- read_excel(file, sheet = 1)
+example_data$试剂厂家 <- paste0(example_data$医院名称, example_data$试剂厂家)
+```
+
+```{r}
+return_base_line <- function(data, var){
+  count_ <- data %>% group_by(!!sym(var), 试剂厂家) %>% reframe(n = n())
+  count_2 <- count_ %>% group_by(!!sym(var)) %>% reframe(n2 = n(), count = min(n))
+  base_line <- (count_2 %>% filter(n2 == length(unique(data$试剂厂家))) %>% filter(count == max(count)))[1,1] %>% unlist
+  base_line %>% unname()
+}
+```
+
+```{r}
+base_line_df <- data.frame(
+  性别 = return_base_line(example_data, "性别"),
+  年龄 = example_data$年龄 %>% median,
+  类别_无监督 = return_base_line(example_data, "类别_无监督")
+  # 病人类型 = return_base_line(example_data, "病人类型")
+)
+```
+
+```{r}
+data <- example_data
+
+# 数值与正态转换
+data$定量结果<-as.numeric(data$定量结果)
+data <- data %>% filter(!is.na(定量结果))
+# 剔除极端离群值
+outlier_indices <- data$定量结果 %>% find_outlier_indices(100)
+data <- data[-outlier_indices,]
+#时间变量处理
+data <- data %>% arrange(采样时间)
+data$采样时间 <-  as.Date(data$采样时间)
+
+
+
+# data$定量结果_transformed <- BoxCox(data$定量结果, lambda = "auto")
+
+data$定量结果_transformed <- as.numeric(data$定量结果) + 0.01
+y_values <- data$定量结果_transformed
+# 手动实现Box-Cox优化
+lambda_seq <- seq(-2, 2, by = 0.05)
+log_likelihoods <- sapply(lambda_seq, function(lambda) {
+  if (lambda == 0) {
+    y_trans <- log(y_values)
+  } else {
+    y_trans <- (y_values^lambda - 1) / lambda
+  }
+  
+  # 计算对数似然
+  n <- length(y_trans)
+  var_y <- var(y_trans)
+  if (is.na(var_y)) return(-Inf)
+  if (var_y == 0) return(-Inf)  # 避免零方差
+  
+  -n/2 * log(var_y) + (lambda - 1) * sum(log(y_values))
+})
+
+# 找到最佳lambda
+best_idx <- which.max(log_likelihoods)
+best_lambda <- lambda_seq[best_idx]
+
+# 利用最优λ进行正态转换
+data$定量结果_transformed <- if (best_lambda == 0) {
+  log(y_values)
+} else {
+  ((y_values)^best_lambda - 1) / best_lambda
+}
+
+
+manu_names_lst <- unique(data$试剂厂家)
+
+manu_result_lst <- list()
+```
+
+```{r}
+for (manu_name in manu_names_lst){
+  # 筛选厂家，剔除无关变量
+  data_subset <- data %>%
+    filter(试剂厂家 == manu_name) %>% 
+    select('采样时间', '定量结果_transformed', '性别', '年龄', '类别_无监督', "定量结果") %>%
+    filter(complete.cases(.))
+  
+  #现在进行回归
+  regression_model <- fit_regression_model(data_subset)
+  
+  data_subset$预测值 <- fitted(regression_model)
+  data_subset$回归残差 <- residuals(regression_model)
+  base_line_prediction <- predict(regression_model, newdata = base_line_df)
+
+  
+  quantile_lst <- c(0.1, 0.3, 0.5, 0.7, 0.9)
+  win_cal_lst <- list()
+  win_cal <- NULL
+  start_time <- Sys.time()
+  population <- data_subset$回归残差
+  for (quantile_ in quantile_lst){
+  
+    # k为我们关注的顺序统计量，比如在2000个样本的90%分位数，也就是k = 1800
+    n <- 100
+    step <- 100
+    k <- (n*quantile_) %>% round(0)
+    
+    # 计算两个Beta分布
+    beta_shape1 <- k
+    beta_shape2 <- n - k + 1
+    start_sample <- 1
+    
+    # 计算有效长度
+    win_num <- (nrow(data_subset) - n) %/% step
+    
+    inner_results <- list()
+    for (i in 0:win_num){
+      
+      win_sample <- c(start_sample + i*step, start_sample + n + i*step)
+      testing_sample <- data_subset$回归残差[c(win_sample[[1]]:win_sample[[2]])]
+      
+      # 计算顺序统计量
+      X_k <- sort(testing_sample)[k]
+      de_sample_population <- population[!(seq_along(population) %in% (win_sample[[1]]:win_sample[[2]]))]
+      U_k <- sum(de_sample_population <= X_k) / length(de_sample_population)
+      prob_ <- pbeta(U_k, beta_shape1, beta_shape2)
+      p_value <- min(prob_, 1 - prob_)
+      
+      # 创建包含所有信息的结果对象
+      result <- list(
+        win_sample_start = win_sample[1],
+        win_sample_stop = win_sample[2],
+        start_time = data_subset$采样时间[win_sample[1]],
+        stop_time = data_subset$采样时间[win_sample[2]],
+        quantile_statistics = testing_sample %>% quantile(quantile_),
+        p_value = p_value
+      )
+      
+      result$等效基线水平 <- ((population %>% quantile(quantile_) + base_line_prediction) %>% boxcox_rev(lambda = best_lambda)) - 0.01
+      result$等效水平 <- ((base_line_prediction + result$quantile_statistics) %>% boxcox_rev(lambda = best_lambda)) - 0.01
+      
+      result$等效波动 <- result$等效水平 - result$等效基线水平
+      
+      inner_results[[length(inner_results) + 1]] <- result
+    }
+    
+    # 将列表结果转换为数据框
+    results_df <- do.call(rbind, lapply(inner_results, function(x) {
+      data.frame(
+        win_sample_start = x$win_sample_start,
+        win_sample_stop = x$win_sample_stop,
+        start_time = x$start_time,
+        stop_time = x$stop_time,
+        quantile_statistics = x$quantile_statistics,
+        p_value = x$p_value,
+        等效基线水平 = x$等效基线水平,
+        等效水平 = x$等效水平,
+        等效波动 = x$等效波动
+      )
+    }))
+    
+    # 进行p值校正
+    results_df$p_value_bonferroni <- p.adjust(results_df$p_value, method = "BH") %>% round(7)
+    win_cal_lst[[as.character(quantile_)]] <- results_df
+    end_time <- Sys.time()
+  }
+  cat(paste0("完成计算，耗时: ", as.numeric(end_time - start_time), " 秒\n"))
+  manu_result_lst[[manu_name]] <- win_cal_lst
+}
+```
+
+```{r}
+# 创建一个空的数据框来存储所有厂家的数据
+all_manu_data <- data.frame()
+
+# 遍历每个厂家
+for(manu_name in names(manu_result_lst)) {
+  # 获取当前厂家的 win_cal_lst
+  current_win_cal_lst <- manu_result_lst[[manu_name]]
+  
+  # 为当前厂家的每个数据框添加分位数标识
+  for(i in seq_along(current_win_cal_lst)) {
+    current_win_cal_lst[[i]]$quantile_level <- paste0(quantile_lst[[i]]*100, "%")
+  }
+  names(current_win_cal_lst) <- paste0(quantile_lst*100, "%")
+  
+  # 合并当前厂家的所有分位数数据
+  current_manu_data <- bind_rows(current_win_cal_lst)
+  
+  # 添加厂家标识
+  current_manu_data$manu_name <- manu_name
+  
+  # 计算窗口中心位置
+  current_manu_data$mid_point <- (current_manu_data$win_sample_start + current_manu_data$win_sample_stop) / 2
+  
+  
+  # 创建悬停文本
+  current_manu_data$hover_text <- paste(
+    "厂家:", current_manu_data$manu_name, "<br>",
+    "分位数:", current_manu_data$quantile_level, "<br>",
+    "开始时间:", format(current_manu_data$start_time, "%Y-%m-%d %H:%M:%S"), "<br>",
+    "结束时间:", format(current_manu_data$stop_time, "%Y-%m-%d %H:%M:%S"), "<br>",
+    "窗口开始:", current_manu_data$win_sample_start, "<br>",
+    "窗口结束:", current_manu_data$win_sample_stop, "<br>",
+    "分位数统计量(变换后):", round(current_manu_data$quantile_statistics, 4), "<br>",
+#    "与参考值的差值(变换后):", round(current_manu_data$diff_quantile_stat, 4), "<br>",
+#    "分位数统计量(原始):", round(current_manu_data$original_quantile_statistics, 4), "<br>",
+#    "与参考值的差值(原始):", round(current_manu_data$original_diff_quantile_stat, 4), "<br>",
+    "p-value:", round(current_manu_data$p_value_bonferroni, 4), "<br>",
+    "等效水平:", round(current_manu_data$等效水平, 4), "<br>",
+    "等效基线水平:", round(current_manu_data$等效基线水平, 4), "<br>",
+    "等效波动:", round(current_manu_data$等效波动, 4), "<br>"
+  )
+  
+  # 将当前厂家的数据添加到总数据框
+  all_manu_data <- bind_rows(all_manu_data, current_manu_data)
+}
+
+# 计算每个厂家和分位数组合的统计量
+stats_summary <- all_manu_data %>%
+  group_by(manu_name, quantile_level) %>%
+  summarise(
+    Q1 = quantile(等效波动, 0.25, na.rm = TRUE),
+    Q3 = quantile(等效波动, 0.75, na.rm = TRUE),
+    IQR_val = Q3 - Q1,
+    Min = min(等效波动, na.rm = TRUE),
+    Max = max(等效波动, na.rm = TRUE),
+    Range_val = Max - Min,
+    error_rate = length(which(p_value_bonferroni <= 0.05))/n(),
+    .groups = 'drop'  # 取消所有分组
+  )
+
+# 创建基础图形
+p <- plot_ly()
+
+# 颜色向量
+color_vec <- c('rgba(0, 0, 255, 0.5)', 'rgba(0, 0, 255, 0.5)', 'rgba(0, 0, 255, 0.5)')
+
+# 首先添加所有散点图（在底层）
+count <- 0
+for(manu_name in names(manu_result_lst)) {
+  count <- count + 1
+  for(quantile_val in paste0(quantile_lst*100, "%")) {
+    # 获取当前厂家和分位数的数据
+    current_data <- all_manu_data %>% 
+      filter(manu_name == !!manu_name, quantile_level == !!quantile_val)
+    
+    # 如果当前组合没有数据，跳过
+    if(nrow(current_data) == 0) next
+    
+    
+    current_data <- current_data %>%
+      mutate(
+        discrete_color = case_when(
+          p_value_bonferroni <= 0.01 ~ "red",
+          p_value_bonferroni > 0.01 & p_value_bonferroni <= 0.05 ~ "orange",
+          p_value_bonferroni > 0.05 ~ "green",
+          TRUE ~ "gray"  # 默认颜色，处理异常情况
+        )
+      )
+    # 添加散点图（在底层）
+    p <- p %>%
+      add_trace(
+        data = current_data,
+        x = ~mid_point,
+        y = ~等效水平,
+        type = 'scatter',
+        mode = 'markers',
+        marker = list(
+          size = 6,
+          color = ~discrete_color,
+          showscale = FALSE,
+          colorbar = list(title = "错误概率"),
+          opacity = 0.7
+        ),
+        hoverinfo = 'text',
+        text = ~hover_text,
+        # name = legend_name,
+        showlegend = FALSE,
+        legendgroup = paste0(manu_name, "_", quantile_val)
+      )
+  }
+}
+
+# 然后添加所有折线图（在最上面）
+count <- 0
+for(manu_name in names(manu_result_lst)) {
+  count <- count + 1
+  for(quantile_val in paste0(quantile_lst*100, "%")) {
+    # 获取当前厂家和分位数的数据
+    current_data <- all_manu_data %>% 
+      filter(manu_name == !!manu_name, quantile_level == !!quantile_val)
+    
+    # 如果当前组合没有数据，跳过
+    if(nrow(current_data) == 0) next
+    
+        # 获取当前组合的统计量
+    current_stats <- stats_summary %>% 
+      filter(manu_name == !!manu_name, quantile_level == !!quantile_val)
+        # 创建图例名称
+    legend_name <- paste0(
+      manu_name, " - 分位数 ", quantile_val, 
+      " \n(IQR: ", round(current_stats$IQR_val, 2), 
+      ", Range: ", round(current_stats$Range_val, 2), 
+      ", Error Rate: ", round(current_stats$error_rate, 3), ")"
+    )
+    
+    # 添加折线图（在最上面）
+    p <- p %>%
+      add_trace(
+        data = current_data,
+        x = ~mid_point,
+        y = ~等效水平,
+        type = 'scatter',
+        mode = 'lines',
+        line = list(
+          color = color_vec[1],
+          width = 2  # 稍微增加线宽使其更明显
+        ),
+        hoverinfo = 'none',
+        name = legend_name,
+        showlegend = TRUE,
+        legendgroup = paste0(manu_name, "_", quantile_val),
+        inherit = FALSE
+      )
+  }
+}
+
+# 添加图例和布局
+p <- p %>%
+  layout(
+    title = paste0("多厂家",example_data$项目名称[[1]],"多分位数等效水平分布"),
+    xaxis = list(title = "窗口中心位置", showgrid = TRUE),
+    yaxis = list(title = "等效水平", showgrid = TRUE),
+    hoverlabel = list(bgcolor = "white", font = list(color = "black")),
+    legend = list(
+      orientation = "h",  # 水平排列
+      x = 0.5,           # 水平居中
+      xanchor = "center", # 水平锚点居中
+      y = -0.2,          # 在图表下方
+      yanchor = "top",    # 垂直锚点为顶部
+      font = list(size = 10),
+      bgcolor = "rgba(255,255,255,0.8)"
+    ),
+    margin = list(r = 250)
+  )
+
+# 显示图形
+# p
+```
+
+```{r}
+# 为每个分位数水平创建小提琴图
+violin_plots <- list()
+
+# 获取所有分位数水平
+quantile_levels <- unique(all_manu_data$quantile_level)
+
+# 计算统一的带宽（bandwidth）
+all_sd <- sd(all_manu_data$等效波动, na.rm = TRUE)
+silverman_bandwidth <- 1.3 * all_sd * nrow(all_manu_data)^(-1/5)
+
+# 为每个分位数水平创建一个小提琴图
+for(quantile_val in quantile_levels) {
+  
+  # 筛选当前分位数的数据
+  current_quantile_data <- all_manu_data %>% 
+    filter(quantile_level == quantile_val)
+  
+  # 计算每个厂家的IQR和Range
+  manu_stats <- current_quantile_data %>%
+    group_by(manu_name) %>%
+    summarise(
+      iqr = IQR(等效波动, na.rm = TRUE),
+      range_val = diff(range(等效波动, na.rm = TRUE)),
+      error_rate = length(which(p_value_bonferroni <= 0.05))/n(),
+      .groups = 'drop'
+    ) %>%
+    mutate(
+      # 创建新的X轴标签，包含统计信息
+      new_label = paste0(
+        manu_name, 
+        "\nIQR:", round(iqr, 2), 
+        ", Range:", round(range_val, 2),
+        "\nError Rate:", round(error_rate, 3)
+      )
+    )
+  
+  # 将新的标签映射回原始数据
+  current_quantile_data <- current_quantile_data %>%
+    left_join(manu_stats %>% select(manu_name, new_label), by = "manu_name")
+  
+  # 创建小提琴图
+  violin_plot <- plot_ly() %>%
+    add_trace(
+      data = current_quantile_data,
+      x = ~manu_name,
+      y = ~等效波动,
+      type = 'violin',
+      box = list(visible = TRUE),
+      meanline = list(visible = TRUE),
+      points = "all",
+      pointpos = -1.5,
+      jitter = 0.1,
+      scalemode = "width",
+      bandwidth = silverman_bandwidth,
+      hoverinfo = 'text',
+      text = ~hover_text,
+      marker = list(
+        size = 4,
+        opacity = 0.7
+      ),
+      color = ~manu_name,
+      colors = "Set1",
+      scalegroup = quantile_val
+    ) %>%
+    layout(
+      title = paste0("", quantile_val, " - 各厂家等效波动"),
+      xaxis = list(
+        title = "",
+        # 使用计算出的新标签作为刻度标签
+        ticktext = manu_stats$new_label,
+        tickvals = manu_stats$manu_name
+      ),
+      yaxis = list(title = paste0(quantile_val,"等效波动分布")),
+      showlegend = FALSE,
+      hoverlabel = list(bgcolor = "white", font = list(color = "black")),
+      margin = list(b = 100)  # 增加底部边距以容纳多行标签
+    )
+  
+  # 将当前分位数的小提琴图添加到列表中
+  violin_plots[[quantile_val]] <- violin_plot
+}
+
+# 如果分位数数量较少，可以并排显示
+if(length(quantile_levels) <= 3) {
+  combined_violin_plot <- subplot(
+    violin_plots, 
+    nrows = 1, 
+    shareY = FALSE,
+    titleX = TRUE,
+    titleY = TRUE
+  ) %>%
+    layout(
+      title = paste0("多厂家", example_data$项目名称[[1]], "各分位数等效波动分布"),
+      showlegend = FALSE
+    )
+  
+  combined_violin_plot
+} else {
+  n_cols <- 2
+  n_rows <- ceiling(length(quantile_levels) / n_cols)
+  
+  combined_violin_plot <- subplot(
+    violin_plots, 
+    nrows = n_rows, 
+    shareY = FALSE,
+    titleX = TRUE,
+    titleY = TRUE,
+    margin = 0.05
+  ) %>%
+    layout(
+      title = paste0("多厂家", example_data$项目名称[[1]], "各分位数等效波动分布"),
+      showlegend = FALSE
+    )
+  
+  # combined_violin_plot
+}
+```
+
+```{r}
+library(htmlwidgets)
+saveWidget(p, file = paste0("C:/Users/13067/Desktop/批间差异分析/试剂批间差异分析",paste(manu_names_lst %>% unlist, collapse = "vs"), example_data$项目名称[[1]], "_scatter+line.html"))
+saveWidget(combined_violin_plot, file = paste0("C:/Users/13067/Desktop/批间差异分析/试剂批间差异分析",paste(manu_names_lst %>% unlist, collapse = "vs"), example_data$项目名称[[1]], "_violin.html"))
+```

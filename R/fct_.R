@@ -659,24 +659,51 @@ discretize_continuous <- function(value_vector, grain = 1) {
 
   # 对于小数颗粒度，使用更精确的计算方式
   start_point <- floor(min_val / grain) * grain
-  breaks <- seq(from = start_point, to = max_val + grain, by = grain)
+  # 计算需要多少个bins
+  n_bins <- ceiling((max_val - start_point) / grain)
+  # 生成breaks，但最后一个break只到max_val（不超出）
+  # 这样最后一个bin的上限就是max_val，不会产生超出数据范围的bin
+  if (n_bins == 0) {
+    # 如果数据范围小于grain，只创建一个bin
+    breaks <- c(start_point, max_val)
+  } else {
+    breaks <- seq(from = start_point, length.out = n_bins + 1, by = grain)
+    # 确保最后一个break不超过max_val（允许稍微超出以包含最大值，但不超出grain）
+    if (breaks[length(breaks)] > max_val + grain * 0.5) {
+      # 如果超出太多，用max_val替换
+      breaks[length(breaks)] <- max_val
+    } else if (breaks[length(breaks)] < max_val) {
+      # 如果还没到max_val，添加max_val作为最后一个break
+      breaks <- c(breaks, max_val)
+    }
+  }
 
   # 4. 生成标签（支持小数颗粒度）
   # 对于小数颗粒度，使用更精确的标签格式
   lower_bounds <- breaks[-length(breaks)]
   upper_bounds <- breaks[-1]
   
+  # 关键修复：最后一个bin的上限使用实际的最大值，而不是计算出的break值
+  # 这样可以避免逆转换时出现超出数据范围的bin
+  if (length(upper_bounds) > 0) {
+    upper_bounds[length(upper_bounds)] <- max_val
+  }
+  
   # 根据颗粒度决定标签格式
   if (grain >= 1) {
     # 整数颗粒度：使用 "a-b" 格式（b 是上限减1，左闭右开）
-    upper_bounds <- upper_bounds - 1
-    bin_labels <- paste0(lower_bounds, "-", upper_bounds)
+    # 但最后一个bin的上限使用max_val（不减1）
+    upper_bounds_adjusted <- upper_bounds - 1
+    upper_bounds_adjusted[length(upper_bounds_adjusted)] <- max_val
+    bin_labels <- paste0(lower_bounds, "-", upper_bounds_adjusted)
   } else {
     # 小数颗粒度：使用 "a-b" 格式（b 是上限，左闭右开，但显示时包含）
-    # 为了显示更友好，将上限稍微调整
+    # 为了显示更友好，将上限稍微调整，但最后一个bin使用max_val
+    upper_bounds_adjusted <- round(upper_bounds - 0.001, 3)
+    upper_bounds_adjusted[length(upper_bounds_adjusted)] <- round(max_val, 3)
     bin_labels <- paste0(
       round(lower_bounds, 3), "-", 
-      round(upper_bounds - 0.001, 3)
+      upper_bounds_adjusted
     )
   }
 
