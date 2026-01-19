@@ -2910,6 +2910,12 @@ filtered_data <- reactive({
   if (!is.null(input[[paste0("filter_", "年龄_离散")]])) {
     data <- data %>% filter(`年龄_离散` %in% input[[paste0("filter_", "年龄_离散")]])
   }  
+  if (!is.null(input[[paste0("filter_", "试剂盒批号")]])) {
+    data <- data %>% filter(`试剂盒批号` %in% input[[paste0("filter_", "试剂盒批号")]])
+  }  
+  if (!is.null(input[[paste0("filter_", "试剂盒盒号")]])) {
+    data <- data %>% filter(`试剂盒盒号` %in% input[[paste0("filter_", "试剂盒盒号")]])
+  }  
   
   return(data)
 }) %>% debounce(1000)
