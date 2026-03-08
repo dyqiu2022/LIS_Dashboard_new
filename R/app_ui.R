@@ -73,7 +73,6 @@ app_ui <- function(request) {
             # 探索性定量分析UI
             mod_quantitative_analysis_ui("origin"),
             nav_panel(title = "参考区间与人群异质性评估"),
-            nav_panel(title = "批间差异分析"),
             mod_batch_difference_optimization_ui("origin"),
             mod_show_filtered_data_ui("origin")
           )
