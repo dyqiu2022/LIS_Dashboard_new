@@ -13,13 +13,17 @@ Imports:
     DT,
     ggplot2,
     golem,
+    jiebaR,
     lubridate,
     plotly,
+    purrr,
     readxl,
     rlang,
     scales,
     shiny,
-    shinyWidgets
+    shinyWidgets,
+    tibble,
+    tidyr
 Suggests: 
     spelling,
     testthat (>= 3.0.0)

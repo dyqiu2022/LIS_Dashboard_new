@@ -38,7 +38,22 @@ app_ui <- function(request) {
   tagList(
     golem_add_external_resources(),
     page_navbar(
-      title = "数据看板",
+      title = tagList(
+        span("数据看板"),
+        # 右上角关闭按钮（纯黑色叉号，无背景/下划线）
+        actionButton(
+          inputId = "app_close",
+          label = HTML("&times;"),
+          class = "app-close-btn",
+          style = paste(
+            "position: absolute; right: 16px; top: 6px;",
+            "background-color: transparent; border: none;",
+            "box-shadow: none; color: #000;",
+            "font-size: 20px; line-height: 1;",
+            "padding: 0; cursor: pointer; text-decoration: none;"
+          )
+        )
+      ),
       theme = my_theme,
       navbar_options = navbar_options(
         collapsible = TRUE

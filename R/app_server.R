@@ -19,4 +19,25 @@ app_server <- function(input, output, session) {
   mod_quantitative_analysis_server("origin", global_store)
   mod_batch_difference_optimization_server("origin", global_store)
   mod_show_filtered_data_server("origin", global_store)
+
+  # 应用级关闭按钮：右上角叉号
+  observeEvent(input$app_close, {
+    showModal(
+      modalDialog(
+        title = "确认关闭",
+        "是否关闭数据看板？",
+        footer = tagList(
+          modalButton("否"),
+          actionButton("confirm_app_close", "是", class = "btn-danger")
+        ),
+        easyClose = TRUE
+      )
+    )
+  })
+
+  observeEvent(input$confirm_app_close, {
+    removeModal()
+    # 停止 Shiny 应用，终止当前 R 进程
+    stopApp()
+  })
 }

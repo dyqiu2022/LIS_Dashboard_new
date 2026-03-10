@@ -121,6 +121,20 @@ mod_keyword_clustering_server <- function(id, global_store) {
       new_table <- new_table[, c(input$selected_grouping_col, "临床诊断数量", "类别_关键词", "类别数量")]
       new_table <- new_table %>% dplyr::arrange(-类别数量, -临床诊断数量)
 
+      # 仅在有待写入类时保留类列；写入完成后不保留，避免聚类统计表格中仍显示已写入的类列
+      pending <- pending_classes()
+      current_tbl <- grouping_table()
+      base_cols <- c(input$selected_grouping_col, "临床诊断数量", "类别_关键词", "类别数量")
+      class_cols <- intersect(setdiff(colnames(current_tbl), base_cols), pending)
+      if (!is.null(current_tbl) && length(class_cols) > 0 && nrow(current_tbl) > 0) {
+        merge_cols <- c(input$selected_grouping_col, "类别_关键词", class_cols)
+        merge_cols <- intersect(merge_cols, colnames(current_tbl))
+        if (length(merge_cols) > 2) {
+          merge_df <- current_tbl[, merge_cols, drop = FALSE]
+          new_table <- merge(new_table, merge_df, by = c(input$selected_grouping_col, "类别_关键词"), all.x = TRUE)
+        }
+      }
+
       grouping_table(new_table)
     })
 
@@ -419,7 +433,14 @@ mod_keyword_clustering_server <- function(id, global_store) {
       req(grouping_table())
       req(input$selected_grouping_col)
 
-      merge_table2 <- grouping_table()[, c(which(!colnames(grouping_table()) %in% c(input$selected_grouping_col, "类别_关键词", "临床诊断数量", "类别数量")))] %>%
+      base_cols <- c(input$selected_grouping_col, "类别_关键词", "临床诊断数量", "类别数量")
+      class_col_idx <- which(!colnames(grouping_table()) %in% base_cols)
+      validate(
+        need(length(class_col_idx) > 0,
+             "没有可写入的类：请先点击「创建新类」并填写类名与条件后再写入。")
+      )
+
+      merge_table2 <- grouping_table()[, class_col_idx, drop = FALSE] %>%
         apply(1, function(i) {
           unlist(i)[which(unlist(i) != "")] %>% paste(collapse = "|")
         }) %>%

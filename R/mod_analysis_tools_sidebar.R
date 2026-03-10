@@ -55,16 +55,16 @@ mod_analysis_tools_sidebar_server <- function(id, global_store){
       na_results <- c("结果无效", "NA")
       data <- global_store[["reactive_data_na_"]]
       if (input$invalid_date_filter == TRUE){
-        data <- data %>% dplyr::filter(!(采样时间 %in% na_results))
-        data <- data %>% dplyr::mutate(采样时间 = safe_date_convert(采样时间))
+        data <- data %>% dplyr::filter(!(`采样时间` %in% na_results))
+        data <- data %>% dplyr::mutate(`采样时间` = safe_date_convert(`采样时间`))
       }
       if (input$invalid_age_filter == TRUE){
-        data <- data %>% dplyr::filter(!(年龄 %in% na_results))
-        data <- data %>% dplyr::mutate(年龄 = as.numeric(年龄))
+        data <- data %>% dplyr::filter(!(`年龄` %in% na_results))
+        data <- data %>% dplyr::mutate(`年龄` = as.numeric(`年龄`))
       }
       if (input$invalid_result_filter == TRUE){
-        data <- data %>% dplyr::filter(!(定量结果 %in% na_results))
-        data <- data %>% dplyr::mutate(定量结果 = as.numeric(定量结果))
+        data <- data %>% dplyr::filter(!(`定量结果` %in% na_results))
+        data <- data %>% dplyr::mutate(`定量结果` = as.numeric(`定量结果`))
       }
       data
     }) %>% debounce(1000)
@@ -101,12 +101,12 @@ mod_analysis_tools_sidebar_server <- function(id, global_store){
               value = range(df[[col]] %>% na.omit())
             )
           } else {
-            if (col=="采样时间" && input$invalid_date_filter == TRUE){
+            if (col == "采样时间" && input$invalid_date_filter == TRUE){
               dateRangeInput(
                 ns(paste0("filter_", col)),
                 "选择采样时间范围:",
-                start = min(global_store[["reactive_data"]]$采样时间),
-                end = max(global_store[["reactive_data"]]$采样时间),
+                start = min(global_store[["reactive_data"]]$`采样时间`),
+                end = max(global_store[["reactive_data"]]$`采样时间`),
                 language = "zh-CN"
               )
             } else if (n_unique > 200) {
@@ -137,31 +137,31 @@ mod_analysis_tools_sidebar_server <- function(id, global_store){
       if (input$invalid_age_filter == TRUE && !is.null(age_input)) {
         # 确保 age_input 长度为 2 (range slider)
         data <- data %>% filter(
-          年龄 >= age_input[1],
-          年龄 <= age_input[2]
+          `年龄` >= age_input[1],
+          `年龄` <= age_input[2]
         )
       } else if (!is.null(age_input)) {
         # 针对离散选择的过滤
-        data <- data %>% filter(年龄 %in% age_input)
+        data <- data %>% filter(`年龄` %in% age_input)
       }
 
       # --- 2. 定量结果过滤的安全检查 ---
       res_input <- input[["filter_定量结果"]]
       if (input$invalid_result_filter == TRUE && !is.null(res_input)) {
         data <- data %>% filter(
-          定量结果 >= res_input[1],
-          定量结果 <= res_input[2]
+          `定量结果` >= res_input[1],
+          `定量结果` <= res_input[2]
         )
       } else if (!is.null(res_input)) {
-        data <- data %>% filter(定量结果 %in% res_input)
+        data <- data %>% filter(`定量结果` %in% res_input)
       }
 
       # --- 3. 采样时间过滤的安全检查 ---
       date_input <- input[["filter_采样时间"]]
       if (input$invalid_date_filter == TRUE && !is.null(date_input)) {
         data <- data %>% filter(
-          采样时间 >= date_input[1],
-          采样时间 <= date_input[2]
+          `采样时间` >= date_input[1],
+          `采样时间` <= date_input[2]
         )
       }
 
