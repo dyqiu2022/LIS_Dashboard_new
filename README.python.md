@@ -30,6 +30,17 @@ docker compose run --rm -e LIS_MODEL_LOCAL_ONLY=0 api python -m app.prewarm_mode
 
 Rancher Desktop 专用部署文件为 `docker-compose.rancher.yml`。WSL 原生 GPU 启动脚本位于 `deployment/wsl-gpu/start.sh`，它使用单个 API 进程串行执行 GPU 任务，模型缺失时直接报错，不会偷偷联网下载。模型预热和离线运行均使用 `LIS_MODEL_LOCAL_ONLY=1`。
 
+## IVD 平台集成
+
+IVD 平台的统一 WSL Docker Engine 编排位于 `SNB_manage_system/docker-compose.yml`，通过 `/lis-dashboard/` 提供本系统。集成镜像必须使用以下构建参数，使静态资源和 API 都保持在独立路径下：
+
+```bash
+docker build --pull=false -f backend/Dockerfile.gpu -t lis_dashboard_api:2026_08_11_10_07 backend
+docker build --pull=false --build-arg VITE_BASE_PATH=/lis-dashboard/ --build-arg VITE_API_BASE=/lis-dashboard/api -t lis_dashboard_web:2026_08_11_10_07 frontend
+```
+
+统一编排默认只读挂载 `/mnt/c/LIS_Dashboard/models`，并复用 `~/.local/share/lis-dashboard/data`。运行阶段的 Compose 服务均配置为 `pull_policy: never`，不会重新拉取镜像。
+
 ## 旧版分析功能对齐
 
 03–06 已按 `R/` 中的 Shiny 模块对齐：

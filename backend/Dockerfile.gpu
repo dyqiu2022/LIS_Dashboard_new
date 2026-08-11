@@ -3,6 +3,7 @@ FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive \
     TOKENIZERS_PARALLELISM=false \
     HF_HOME=/models/huggingface \
     HUGGINGFACE_HUB_CACHE=/models/huggingface/hub
@@ -12,8 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY pyproject.toml requirements.txt ./
-RUN python3 -m pip install --upgrade pip --break-system-packages \
-    && python3 -m pip install -e '.[worker]' --break-system-packages
+RUN python3 -m pip install -e '.[worker]' --break-system-packages
 COPY app ./app
 RUN mkdir -p /data /models
 EXPOSE 8000
