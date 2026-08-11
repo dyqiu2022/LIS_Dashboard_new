@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net462</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>dashboard_viewer</AssemblyName>
+    <RootNamespace>LISDashboard</RootNamespace>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>10.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CefSharp.WinForms" Version="126.2.70" />
+  </ItemGroup>
+
+</Project>

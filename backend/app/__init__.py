@@ -1,0 +1,1 @@
+"""LIS Dashboard FastAPI application."""

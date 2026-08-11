@@ -1,0 +1,32 @@
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.gpu
+    environment:
+      LIS_EMBEDDING_DEVICE: cuda
+      LIS_EMBEDDING_DTYPE: bfloat16
+      LIS_EMBEDDING_BATCH_SIZE: 64
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.gpu
+    environment:
+      LIS_EMBEDDING_DEVICE: cuda
+      LIS_EMBEDDING_DTYPE: bfloat16
+      LIS_EMBEDDING_BATCH_SIZE: 64
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

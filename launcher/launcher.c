@@ -24,8 +24,10 @@ void CreateShortcut() {
   SHGetSpecialFolderPathA(HWND_DESKTOP, desktopPath, CSIDL_DESKTOP, FALSE);
   sprintf(linkPath, "%s\\%s.lnk", desktopPath, APP_NAME);
   
-  // 如果快捷方式已存在，就不再重复创建
-  if (access(linkPath, 0) == 0) return;
+  // 每次都重建快捷方式，确保指向正确路径
+  if (access(linkPath, 0) == 0) {
+    DeleteFileA(linkPath);
+  }
   
   // 初始化 COM 库
   CoInitialize(NULL);
@@ -86,10 +88,12 @@ int main() {
     char viewerPath[MAX_PATH];
     char viewerCmd[MAX_PATH * 2];
 
-    // 优先在根目录查找 dashboard_viewer.exe
+    // 按优先级查找 dashboard_viewer.exe
     sprintf(viewerPath, "%s\\dashboard_viewer.exe", workDir);
     if (access(viewerPath, 0) != 0) {
-      // 若不存在，则尝试 gui 子目录
+      sprintf(viewerPath, "%s\\gui\\publish\\dashboard_viewer.exe", workDir);
+    }
+    if (access(viewerPath, 0) != 0) {
       sprintf(viewerPath, "%s\\gui\\dashboard_viewer.exe", workDir);
     }
 
